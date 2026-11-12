@@ -68,3 +68,11 @@
 {"text": "I want a pen. No wait, a shirt.", "expect": "shirt", "tag": "self_correction"}
 {"text": "Shirt. Actually, plushie.", "expect": "plushie", "tag": "self_correction"}
 {"text": "Not the pen, the plushie", "expect": "plushie", "tag": "negation"}
+{"text": "Hey, I'm Sam. What do you have?", "expect": "unclear", "expect_name": "Sam", "after_greeting": true, "tag": "after_greeting"}
+{"text": "Hi! I'm Priya. What is this?", "expect": "unclear", "expect_name": "Priya", "after_greeting": true, "tag": "after_greeting"}
+{"text": "Jordan. What are you giving away?", "expect": "unclear", "expect_name": "Jordan", "after_greeting": true, "tag": "after_greeting"}
+{"text": "I'm Maya", "expect": "unclear", "expect_name": "Maya", "after_greeting": true, "tag": "after_greeting"}
+{"text": "Hey there", "expect": "unclear", "after_greeting": true, "tag": "after_greeting"}
+{"text": "I'm Alex, can I get a plushie?", "expect": "plushie", "expect_name": "Alex", "after_greeting": true, "tag": "after_greeting"}
+{"text": "Chris. Do you have shirts?", "expect": "unclear", "expect_name": "Chris", "after_greeting": true, "tag": "after_greeting"}
+{"text": "No thanks, I'm just looking", "expect": "none", "after_greeting": true, "tag": "after_greeting"}

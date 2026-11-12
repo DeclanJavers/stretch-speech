@@ -74,10 +74,10 @@ Measured on an M3 Pro MacBook, 2026-11-11, same prompt for both:
 | Model | Runs on | Item accuracy (70 cases) | Names | LLM reply time | Model size |
 |---|---|---|---|---|---|
 | Qwen 3.5 4B (MLX 4-bit) | LM Studio | **97.1%** (68/70) | 5/5 | 1.6 s | 3.1 GB |
-| LFM3 1.7B (GGUF Q4_0) | llama.cpp | 91.0% avg over 3 runs (87–94%) | 15/15 | **0.8 s** | 1.05 GB |
+| LFM3 1.7B (GGUF Q4_0) | llama.cpp | 91.9% avg over 3 runs, 78 cases (91–94%) | 33/33 | **0.8 s** | 1.05 GB |
 | LFM2.5 2.6B (MLX 4-bit) | LM Studio | 84.3% (59/70) | 5/5 | 1.15 s | 1.6 GB |
 
-LFM3's misses are mostly requests for two items ("a pen and a plushie"), out-of-stock requests, and self-corrections ("Shirt. Actually, plushie."). In a live test it also treated "Hi, I'm Declan. What do you have?" as an order for a pen.
+LFM3 was re-tested after adding 8 cases that follow the real greeting ("What's your name?"). Before that fix it read "Hey, I'm Sam. What do you have?" as an order for a shirt and said "My name is Sam." Two worked examples in the prompt fixed that case (3/3 live); its remaining misses are self-corrections ("Shirt. Actually, plushie."), "Do you have shirts?" read as a choice, and some garbled speech. Qwen and LFM2.5 were scored on the original 70 cases with the earlier prompt.
 
 LFM's misses are mostly declines ("I'm all set" read as still deciding) and requests for several items or the wrong item. In a live test it also said it had no t-shirts when asked for a "tea shirt".
 

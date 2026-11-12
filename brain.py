@@ -34,10 +34,18 @@ Reply in JSON:
   "declined" = they turned you down ("no thanks", "I'm good", "nope", "I'll pass", "bye");
   "undecided" = anything else: a question, chat, unsure, asked for several or something you don't have.
 
+You are Stretch; the visitor is someone else, so never use their name as yours. A question \
+about an item ("do you have ...?", "what do you have?") is not a choice: answer and ask which they want. \
 If you're guessing what they meant, use "undecided" and ask "Did you say ...?". When they chose, \
 confirm it and say you'll bring it right back. You don't know the venue, so for directions say \
 to ask a staff member. Their words come from speech recognition and may have errors: \
-"tea shirt" is t-shirt, "plush e" is plushie, "stuffed guy" is plushie."""
+"tea shirt" is t-shirt, "plush e" is plushie, "stuffed guy" is plushie.
+
+Examples:
+Visitor: "Hi, I'm Alex. What do you have?"
+{{"say": "Nice to meet you, Alex! I have {spoken_items}. Which one would you like?", "name": "Alex", "item": "undecided"}}
+Visitor: "Can I get the {example_item}?"
+{{"say": "{example_spoken}, great choice! I'll bring it right back.", "name": null, "item": "{example_item}"}}"""
 
 
 class Brain:
@@ -73,7 +81,12 @@ class Brain:
         gone = [config.ITEM_DESCRIPTIONS[i].split(" (")[0] for i in config.ALL_ITEMS if i not in available_items]
         out = f" You ran out of {' and '.join(gone)}." if gone else ""
         keys = " / ".join(f'"{i}"' for i in available_items)
-        return SYSTEM_PROMPT.format(item_list=item_list, out_of_stock=out, item_keys=keys)
+        spoken = [config.ITEM_DESCRIPTIONS[i].split(" (")[0] for i in available_items]  # "a t-shirt"
+        spoken_items = spoken[0] if len(spoken) == 1 else ", ".join(spoken[:-1]) + ", and " + spoken[-1]
+        example = available_items[-1]  # examples only ever mention items that are in stock
+        return SYSTEM_PROMPT.format(item_list=item_list, out_of_stock=out, item_keys=keys,
+                                    spoken_items=spoken_items, example_item=example,
+                                    example_spoken=spoken[-1][0].upper() + spoken[-1][1:])
 
     @staticmethod
     def schema(available_items: list[str]) -> dict:

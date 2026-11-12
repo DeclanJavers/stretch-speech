@@ -19,11 +19,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
 from brain import Brain  # noqa: E402
+from conversation import GREETINGS  # noqa: E402
 
 HERE = pathlib.Path(__file__).parent
 OPENER = Brain.assistant_turn(
     "Hi there! I'm Stretch, and I'm handing out free swag today. Would you like a pen, a t-shirt, or a plushie?",
     None, None)
+# Real conversations open by asking the visitor's name, so some cases start here instead.
+GREETING_OPENER = Brain.assistant_turn(GREETINGS[0], None, None)
 
 
 def convert(turn: dict) -> dict:
@@ -49,7 +52,8 @@ def main() -> None:
     for run in range(args.runs):
         for c in cases:
             items = c.get("items", config.ALL_ITEMS)
-            history = [OPENER, *map(convert, c.get("history", [])), {"role": "user", "content": c["text"]}]
+            opener = GREETING_OPENER if c.get("after_greeting") else OPENER
+            history = [opener, *map(convert, c.get("history", [])), {"role": "user", "content": c["text"]}]
             r = brain.respond(history, items)
             got = r["item"] if r["item"] is not None else "unclear"
             row = {"run": run, "text": c["text"], "tag": c["tag"], "expect": c["expect"], "got": got,
