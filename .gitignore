@@ -1,0 +1,12 @@
+# Python environment (rebuild with: uv sync)
+.venv/
+__pycache__/
+*.pyc
+
+# Conversation transcripts contain real people's names
+logs/
+
+# Eval output (regenerate with: uv run eval/run_eval.py)
+eval/results-*.json
+
+.DS_Store
