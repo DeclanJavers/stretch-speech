@@ -10,3 +10,4 @@ logs/
 eval/results-*.json
 
 .DS_Store
+CLAUDE.md
