@@ -4,16 +4,17 @@
                     -> (declined / unclear / no response)                                     -> IDLE
 
 TALKING hands the whole conversation to the language server on the Mac and polls
-for the outcome. For tonight's demo, fetching is just "drive forward, pause, drive
-back"; picking and handover are mocked.
+for the outcome. For tonight's demo, fetching is "turn toward the item (pen +90,
+plushie 180, t-shirt -90 deg), pause, turn back"; picking and handover are mocked.
 
     ros2 run stretch_swag behavior
-    ros2 run stretch_swag behavior --ros-args -p drive_s:=6.0 -p language_server_url:=http://192.168.64.1:8090
+    ros2 run stretch_swag behavior --ros-args -p fetch_distance_m:=2.0 -p language_server_url:=http://192.168.64.1:8090
 
 Watch it:  ros2 topic echo /swag/state
 """
 
 import json
+import math
 import pathlib
 import threading
 import time
@@ -27,6 +28,8 @@ from .language_client import LanguageClient, LanguageServerError
 from .motion import BaseDriver
 
 SPOKEN_ITEM = {"pen": "pen", "shirt": "t-shirt", "plushie": "plushie"}
+# Where each item "is" for the demo: turn this far (positive = counter-clockwise), then back.
+ITEM_TURN_RAD = {"pen": math.pi / 2, "plushie": math.pi, "shirt": -math.pi / 2}
 
 
 class SwagBehavior(Node):
@@ -36,8 +39,11 @@ class SwagBehavior(Node):
         self.server_url = p("language_server_url", "http://192.168.64.1:8090").value
         self.items = list(p("items", ["pen", "shirt", "plushie"]).value)
         self.cmd_vel_topic = p("cmd_vel_topic", "/stretch/cmd_vel").value
-        self.drive_speed = float(p("drive_speed", 0.15).value)        # m/s
-        self.drive_s = float(p("drive_s", 4.0).value)                 # each way: 0.15 m/s * 4 s = 0.6 m
+        self.odom_topic = p("odom_topic", "/odom").value
+        self.fetch_distance_m = float(p("fetch_distance_m", 1.524).value)   # 5 ft each way
+        # Commanded speeds. The VM's sim runs at ~1/3 real time, so on screen these look ~3x slower.
+        self.drive_speed = float(p("drive_speed", 0.3).value)               # m/s
+        self.turn_speed = float(p("turn_speed", 1.0).value)                 # rad/s
         self.pickup_s = float(p("pickup_s", 3.0).value)
         self.idle_s = float(p("idle_s", 3.0).value)                   # pause before greeting the next person
         self.poll_s = float(p("poll_s", 0.5).value)
@@ -45,7 +51,7 @@ class SwagBehavior(Node):
         log_dir = pathlib.Path(p("log_dir", str(pathlib.Path.home() / ".ros" / "stretch_swag")).value)
 
         self.client = LanguageClient(self.server_url)
-        self.driver = BaseDriver(self, self.cmd_vel_topic)
+        self.driver = BaseDriver(self, self.cmd_vel_topic, self.odom_topic)
         self.state_pub = self.create_publisher(String, "/swag/state", 10)
         self.shutdown = threading.Event()
         self.state = "IDLE"
@@ -152,11 +158,22 @@ class SwagBehavior(Node):
         self.log_event("error", error="conversation timeout")
         return None
 
+    def run_skills(self, steps) -> bool:
+        """Run (skill_name, callable) steps in order; stop at the first failure."""
+        for skill, do in steps:
+            r = do()
+            self.log_event("skill", skill=skill, **r)
+            if not r["success"]:
+                self.get_logger().warn(f"{skill} failed: {r['reason']}")
+                return False
+        return True
+
     def fetch(self, item: str, name: str | None) -> None:
-        self.set_state("FETCHING", item=item)
-        r = self.driver.drive(self.drive_speed, self.drive_s)
-        self.log_event("skill", skill="drive_to_table", **r)
-        if not r["success"]:
+        # Demo: each item "lives" in a different direction, so the robot visibly reacts to the
+        # answer. Turn toward it, pause (mock pickup), turn back to face the visitor.
+        angle = ITEM_TURN_RAD.get(item, math.pi)
+        self.set_state("FETCHING", item=item, turn_deg=round(math.degrees(angle)))
+        if not self.run_skills([("turn_to_item", lambda: self.driver.turn(angle, self.turn_speed))]):
             return
 
         self.set_state("PICKING_UP", item=item)       # mocked: just wait
@@ -164,9 +181,7 @@ class SwagBehavior(Node):
             return
 
         self.set_state("RETURNING", item=item)
-        r = self.driver.drive(-self.drive_speed, self.drive_s)
-        self.log_event("skill", skill="drive_to_person", **r)
-        if not r["success"]:
+        if not self.run_skills([("turn_to_person", lambda: self.driver.turn(-angle, self.turn_speed))]):
             return
 
         self.set_state("HANDOVER", item=item)          # mocked: just say it
