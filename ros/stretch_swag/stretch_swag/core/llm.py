@@ -1,26 +1,18 @@
-"""Talking to the LLM: any OpenAI-compatible /v1/chat/completions endpoint.
+"""Talking to the LLM: any OpenAI-compatible /v1/chat/completions endpoint, with tools.
 
-Standard library only (runs in ROS's system Python). Replies are streamed, so the
-robot can start speaking the first sentence while the rest is generated.
-
-The reply format (see prompt.SYSTEM_PROMPT):
-    <listening>
-    <speaking> Great, a pen it is! <name="Jeff"> <transition request_item item="pen">
-
-llama.cpp's server accepts a `grammar` field that forces this format token by token.
-Other servers ignore it, so parse() also copes with slightly-off output.
+Standard library only (runs in ROS's system Python). llama-server needs `--jinja`
+for tool calls: it then formats tools with the model's own chat template and parses
+the model's tool calls back into the standard `tool_calls` field.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
-from typing import Iterator
-
-from .states import Trigger
+from dataclasses import dataclass, field
 
 
 class LLMError(RuntimeError):
@@ -29,159 +21,81 @@ class LLMError(RuntimeError):
 
 class LLMClient:
     def __init__(self, base_url: str, model: str, timeout_s: float = 20.0,
-                 temperature: float = 0.3, max_tokens: int = 120):
+                 temperature: float = 0.3, max_tokens: int = 150):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_s = timeout_s
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-    def stream(self, messages: list[dict], grammar: str | None = None) -> Iterator[str]:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, require_tool: bool = False) -> dict:
+        """Returns the assistant message: {"content": str | None, "tool_calls": [...]}."""
         body = {
             "model": self.model,
             "messages": messages,
-            "stream": True,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "cache_prompt": True,                                   # llama.cpp: reuse the unchanged prefix
             "chat_template_kwargs": {"enable_thinking": False},     # llama.cpp: no thinking
             "reasoning_effort": "none",                             # LM Studio: no thinking
         }
-        if grammar:
-            body["grammar"] = grammar
+        if tools:
+            body["tools"] = tools
+            if require_tool:
+                body["tool_choice"] = "required"
         req = urllib.request.Request(self.base_url + "/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json",
                                               "Authorization": "Bearer none"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
-                for raw in r:
-                    line = raw.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        return
-                    chunk = json.loads(payload)
-                    choices = chunk.get("choices") or []
-                    if choices:
-                        delta = choices[0].get("delta") or {}
-                        if delta.get("content"):
-                            yield delta["content"]
-        except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
+                return json.loads(r.read())["choices"][0]["message"]
+        except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError,
+                KeyError, IndexError) as e:
             raise LLMError(f"LLM request to {self.base_url} failed: {e}") from e
 
     def health(self) -> list[str]:
         try:
             with urllib.request.urlopen(self.base_url + "/models", timeout=5) as r:
-                return [m["id"] for m in json.loads(r.read()).get("data", [])]
+                data = json.loads(r.read())
+            return [m.get("id") or m.get("name") for m in data.get("data") or data.get("models") or []]
         except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
             raise LLMError(f"can't reach LLM at {self.base_url}: {e}") from e
 
 
-def build_grammar(can_listen: bool, items: list[str], triggers: list[Trigger]) -> str:
-    """GBNF grammar for llama.cpp: the reply can only be one of the allowed forms."""
-    trans = []
-    for trig in triggers:
-        if trig == Trigger.REQUEST_ITEM and items:
-            trans.append('"request_item item=\\"" item "\\""')
-        elif trig != Trigger.REQUEST_ITEM:
-            trans.append(f'"{trig.value}"')
-    rules = [
-        "root ::= " + ('"<listening>" | speak' if can_listen else "speak"),
-        'speak ::= "<speaking> " text name?' + (" transition?" if trans else ""),
-        "text ::= [^<\\n]+",
-        'name ::= " <name=\\"" [A-Za-z .\'-]+ "\\">"',
-    ]
-    if trans:
-        rules.append('transition ::= " <transition " (' + " | ".join(trans) + ') ">"')
-        if items:
-            rules.append("item ::= " + " | ".join(f'"{i}"' for i in items))
-    return "\n".join(rules) + "\n"
+_ids = itertools.count(1)
 
 
 @dataclass
 class Reply:
-    kind: str                      # "listening" | "speaking"
-    speech: str = ""
-    name: str | None = None
-    trigger: Trigger | None = None
-    item: str | None = None
-
-    def canonical(self) -> str:
-        """The exact text stored as the robot's turn (and shown back to the model)."""
-        if self.kind == "listening":
-            return "<listening>"
-        out = f"<speaking> {self.speech}"
-        if self.name:
-            out += f' <name="{self.name}">'
-        if self.trigger == Trigger.REQUEST_ITEM:
-            out += f' <transition request_item item="{self.item}">'
-        elif self.trigger:
-            out += f" <transition {self.trigger.value}>"
-        return out
+    speech: str = ""                     # what to say out loud ("" = nothing)
+    tool: str | None = None              # the tool the model called, if any (first allowed one)
+    args: dict = field(default_factory=dict)
+    call_id: str | None = None
 
 
-_NAME = re.compile(r'<name="([^"]{1,40})">')
-_TRANS = re.compile(r'<transition\s+(\w+)(?:\s+item="(\w+)")?\s*>')
+_JUNK = re.compile(r"<\|?/?(tool_call|think)\|?>.*", re.S)   # stray template markup in the text
 
 
-def parse(text: str) -> Reply:
-    text = text.strip()
-    if text.startswith("<listening>") or not text:
-        return Reply("listening")
-    body = text[len("<speaking>"):] if text.startswith("<speaking>") else text
-    speech = body.split("<", 1)[0].strip()
-    if not speech:
-        return Reply("listening")
-    name = _NAME.search(body)
-    trans = _TRANS.search(body)
-    trigger, item = None, None
-    if trans:
-        try:
-            trigger = Trigger(trans.group(1))
-        except ValueError:
-            trigger = None
-        item = trans.group(2)
-    return Reply("speaking", speech=speech, name=name.group(1).strip() if name else None,
-                 trigger=trigger, item=item)
+def parse_message(msg: dict, allowed: list[str]) -> Reply:
+    reply = Reply(speech=_JUNK.sub("", msg.get("content") or "").strip())
+    for call in msg.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        if fn.get("name") in allowed:
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            reply.tool, reply.args = fn["name"], args if isinstance(args, dict) else {}
+            reply.call_id = call.get("id") or f"call_{next(_ids)}"
+            break
+    if reply.tool == "say_to_visitor":
+        reply.speech, reply.tool = str(reply.args.get("text") or reply.speech).strip(), None   # plain speech
+    elif reply.tool in ("fetch_item", "end_conversation"):
+        reply.speech = str(reply.args.pop("say", "") or reply.speech).strip()
+    elif reply.tool == "wait_for_visitor":
+        reply.speech = ""                # models narrate the wait ("Waiting for the visitor..."): never say it
+    return reply
 
 
-class SentenceSplitter:
-    """Feed streamed text; get back whole sentences of the spoken part as they complete."""
-
-    _END = re.compile(r"(.+?[.!?])(\s+|$)")
-
-    def __init__(self):
-        self.text = ""
-        self.sent = 0           # characters of speech already emitted
-        self.closed = False     # reached the first tag after the speech
-
-    def _speech(self) -> str:
-        if not self.text.startswith("<speaking>"):
-            return ""          # <listening>, or the tag hasn't fully arrived yet
-        body = self.text[len("<speaking>"):]
-        if "<" in body:
-            self.closed = True
-            body = body.split("<", 1)[0]
-        return body
-
-    def feed(self, delta: str) -> list[str]:
-        self.text += delta
-        speech = self._speech()
-        out = []
-        while True:
-            rest = speech[self.sent:]
-            m = self._END.match(rest)
-            if not m or (not m.group(2) and not self.closed):
-                break
-            sentence = m.group(1).strip()
-            if sentence:
-                out.append(sentence)
-            self.sent += m.end()
-        return out
-
-    def flush(self) -> list[str]:
-        speech = self._speech()
-        rest = speech[self.sent:].strip()
-        self.sent = len(speech)
-        return [rest] if rest else []
+def sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s]

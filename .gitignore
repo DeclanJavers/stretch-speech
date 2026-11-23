@@ -11,3 +11,6 @@ language-server/eval/results-*.json
 
 .DS_Store
 CLAUDE.md
+
+# Eval output (regenerate with: python3 ros/stretch_swag/eval/run_eval.py)
+ros/stretch_swag/eval/results-*.json

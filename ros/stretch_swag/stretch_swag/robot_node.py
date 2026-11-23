@@ -34,7 +34,7 @@ from .core.conversation import Conversation
 from .core.events import EventLog
 from .core.face_client import FaceClient, FaceServiceError
 from .core.llm import LLMClient, LLMError, Reply
-from .core.prompt import ITEM_WORDS
+from .core.prompt import GREETINGS, ITEM_WORDS
 from .core.registry import Registry
 from .core.states import InvalidTransition, RobotState, State, Trigger, next_state
 from .motion import BaseDriver, wrap
@@ -83,6 +83,7 @@ class SwagRobot(Node):
         self.safety_distance = float(p("safety_distance", 0.6))
         self.tick_s = float(p("tick_s", 0.5))
         self.no_response_s = float(p("no_response_s", 20.0))
+        self.still_there_s = float(p("still_there_s", 8.0))
         self.max_conversation_s = float(p("max_conversation_s", 180.0))
         self.search_timeout_s = float(p("search_timeout_s", 30.0))
         self.recall_s = float(p("recall_s", 10.0))
@@ -102,7 +103,10 @@ class SwagRobot(Node):
         self.registry = Registry()
         self.log = EventLog(run_dir / "events.jsonl")
         self.speaker = TopicSpeaker(self)
-        self.conv = Conversation(self.llm, self.log, self.registry, lambda: self.robot, self.speaker,
+        self.turn_note: str | None = None        # extra line for the LLM's system prompt, set per state
+        self.turn_tools: list[str] = []           # tools the LLM may call right now
+        self.conv = Conversation(self.llm, self.log, self.registry,
+                                 lambda: (self.robot, self.turn_note, self.turn_tools), self.speaker,
                                  llm_log_path=run_dir / "llm.jsonl")
         self.driver = BaseDriver(self, p("cmd_vel_topic", "/stretch/cmd_vel"), p("odom_topic", "/odom"),
                                  linear_speed=float(p("linear_speed", 0.3)),
@@ -344,61 +348,66 @@ class SwagRobot(Node):
                 return self.take_candidate()
 
     def handle_reply(self, reply: Reply | None) -> bool:
-        """Apply an LLM transition, if any and allowed. Returns True if the state changed."""
-        if not reply or not reply.trigger:
+        """Turn the LLM's tool call (if any) into a transition. Returns True if the state changed."""
+        if not reply or reply.tool not in ("fetch_item", "end_conversation"):
             return False
         person = self.target()
-        allowed = self.robot.llm_triggers()
-        if reply.trigger not in allowed or (reply.trigger == Trigger.REQUEST_ITEM
-                                            and reply.item not in self.robot.items_in_stock()):
-            self.log.append("note", self.robot.target,
-                            text=f"rejected LLM transition {reply.trigger.value} item={reply.item}")
-            return False
         self.wait_speech_done()
         self.conv.stop()
-        if reply.trigger == Trigger.REQUEST_ITEM:
-            person.item, person.outcome = reply.item, "waiting"
-            self.log.append("person", person.id, change="outcome", outcome="waiting", item=reply.item)
-        else:
-            person.outcome = "declined" if reply.trigger == Trigger.DECLINE else "ended"
-            self.log.append("person", person.id, change="outcome", outcome=person.outcome)
-            self.robot.target = None
-        return self.fire(reply.trigger)
+        if reply.tool == "fetch_item":                   # item already checked against stock by the engine
+            person.item, person.outcome = reply.args["item"], "waiting"
+            self.log.append("person", person.id, change="outcome", outcome="waiting", item=person.item)
+            return self.fire(Trigger.REQUEST_ITEM)
+        declined = reply.args.get("reason", "declined") == "declined"
+        person.outcome = "declined" if declined else "ended"
+        self.log.append("person", person.id, change="outcome", outcome=person.outcome)
+        self.robot.target = None
+        return self.fire(Trigger.DECLINE if declined else Trigger.END)
 
     def do_talking(self) -> None:
         person = self.target()
-        resumed = person.outcome in ("waiting", "missed")
-        if person.outcome == "waiting" and self.robot.held_item is None \
-                and person.fetch_failures >= self.max_fetch_failures:
-            self.conv.start(person.id)
-            self.conv.event_turn("you came back empty-handed again because picking up failed; apologize that "
-                                 "you can't get them anything right now and say goodbye")
-            self.wait_speech_done()
-            self.conv.stop()
-            person.outcome = "ended"
-            self.log.append("person", person.id, change="outcome", outcome="ended", reason="pickup kept failing")
-            self.robot.target = None
-            self.fire(Trigger.END)
-            return
-        if person.outcome == "waiting" and self.robot.held_item is None:
-            reason = (f"you came back without the {ITEM_WORDS.get(person.item, person.item)} because picking it "
-                      f"up failed; apologize and ask if they'd like something else that's in stock")
-            person.item = None
-        elif person.outcome == "missed":
-            reason = (f"you found this visitor again after missing them earlier; ask if they still want "
-                      f"the {ITEM_WORDS.get(person.item, person.item)}")
-        else:
-            reason = "a new visitor is in front of you; greet them, say you're giving away swag, and ask their name"
-        person.outcome = "talking"
+        item_word = ITEM_WORDS.get(person.item, person.item)
+        self.turn_tools = ["say_to_visitor", "fetch_item", "wait_for_visitor", "end_conversation"]
+        self.turn_note = None
         self.conv.start(person.id)
-        started = time.time()
-        if self.handle_reply(self.conv.event_turn(reason)):
+        if person.outcome == "waiting" and self.robot.held_item is None:
+            # Back from a failed fetch (the fetch_item result says what went wrong).
+            if person.fetch_failures >= self.max_fetch_failures:
+                self.turn_note, self.turn_tools = (f"Picking things up keeps failing, so you can't give {person.label()} "
+                                                   f"anything right now. Apologize and say goodbye."), ["say_to_visitor"]
+                self.conv.respond()
+                self.wait_speech_done()
+                self.conv.stop()
+                person.outcome = "ended"
+                self.log.append("person", person.id, change="outcome", outcome="ended", reason="pickup kept failing")
+                self.robot.target = None
+                self.fire(Trigger.END)
+                return
+            self.turn_note = f"You couldn't get the {item_word}. Apologize and ask if they'd like something else."
+            person.item = None
+            first = self.conv.respond()
+        elif person.outcome == "missed":
+            self.turn_note = f"Ask if they still want the {item_word}."
+            first = self.conv.respond()
+        else:
+            self.conv.say(self.rng.choice(GREETINGS))
+            first = None
+        resumed = person.outcome in ("waiting", "missed")
+        person.outcome = "talking"
+        if self.handle_reply(first):
             return
+        self.turn_note = None
+        started, asked_still_there = time.time(), False
         while self.robot.state == State.TALKING and self.sleep(self.tick_s):
             if self.handle_reply(self.conv.tick()):
                 return
+            silent = self.conv.unanswered_for()
+            if silent > self.still_there_s and not asked_still_there:
+                asked_still_there = True
+                self.conv.say("Are you still there?")
+                continue
             had_reply = any(e.kind == "heard" and e.person_id == person.id for e in self.log.snapshot())
-            if self.conv.unanswered_for() > self.no_response_s or self.conv.failures >= 5 \
+            if silent > self.no_response_s or self.conv.failures >= 5 \
                     or time.time() - started > self.max_conversation_s:
                 self.conv.stop()
                 person.outcome = "ended" if had_reply or resumed else "no_response"
@@ -450,16 +459,16 @@ class SwagRobot(Node):
         self.found = None
         self.driver.interrupt.clear()
         self.conv.start(person.id)
-        call = (f"you're back at {person.label()}'s spot with their {ITEM_WORDS.get(self.robot.held_item, 'news')} "
-                f"but can't see them; call out their name so they turn around")
-        self.conv.event_turn(call)
+        held = ITEM_WORDS.get(self.robot.held_item)
+        call = (f"{person.name}? " if person.name else "Hello? ") + (f"I have your {held}!" if held else "I'm back!")
+        self.conv.say(call)
         deadline, last_call = time.time() + self.search_timeout_s, time.time()
         while self.found is None and time.time() < deadline and not self.shutdown.is_set():
             self.driver.turn(math.pi / 6)
             if self.found or not self.sleep(0.5):
                 break
             if time.time() - last_call > self.recall_s:
-                self.conv.event_turn(f"still can't see {person.label()}; call out to them again")
+                self.conv.say(call)
                 last_call = time.time()
         self.conv.stop()
         holding = self.robot.held_item is not None
@@ -485,7 +494,9 @@ class SwagRobot(Node):
         person = self.target()
         item = self.robot.held_item
         self.conv.start(person.id)
-        self.conv.event_turn(f"you found {person.label()}; hand them the {ITEM_WORDS.get(item, item)}")
+        self.turn_note, self.turn_tools = f"Hand them the {ITEM_WORDS.get(item, item)}.", ["say_to_visitor"]
+        self.conv.respond()
+        self.turn_note, self.turn_tools = None, ["say_to_visitor", "wait_for_visitor"]
         self.sleep(self.handover_s)                           # mocked: extend arm, open gripper
         self.log.append("skill", person.id, skill="handover", success=True, reason="")
         self.robot.held_item = None

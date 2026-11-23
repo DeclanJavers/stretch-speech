@@ -1,0 +1,16 @@
+{"text": "I'd like a", "expect": "wait", "tag": "cut_off"}
+{"text": "Can I get the", "expect": "wait", "tag": "cut_off"}
+{"text": "I think I want", "expect": "wait", "tag": "cut_off"}
+{"text": "um, so", "expect": "wait", "tag": "cut_off"}
+{"text": "Hi, I'm", "expect": "wait", "tag": "cut_off", "after_greeting": true}
+{"text": "Could I have a, uh", "expect": "wait", "tag": "cut_off"}
+{"text": "My name is", "expect": "wait", "tag": "cut_off", "after_greeting": true}
+{"text": "I'll take the", "expect": "wait", "tag": "cut_off"}
+{"text": "So I was wondering if", "expect": "wait", "tag": "cut_off"}
+{"text": "I think... I'd like the", "expect": "wait", "tag": "cut_off"}
+{"text": "I'm Jeff.", "expect": "unclear", "tag": "name_only", "after_greeting": true}
+{"text": "Hi, I'm Priya!", "expect": "unclear", "tag": "name_only", "after_greeting": true}
+{"text": "Sam. Nice to meet you.", "expect": "unclear", "tag": "name_only", "after_greeting": true}
+{"text": "I'm Jeff, can I get a pen?", "expect": "pen", "expect_name": "Jeff", "tag": "name_and_item", "after_greeting": true}
+{"text": "Maria. A plushie please!", "expect": "plushie", "expect_name": "Maria", "tag": "name_and_item", "after_greeting": true}
+{"text": "Hey I'm Leo, I'll take a t-shirt", "expect": "shirt", "expect_name": "Leo", "tag": "name_and_item", "after_greeting": true}

@@ -1,9 +1,12 @@
-"""The conversation engine: one conversation at a time, driven by ticks and events.
+"""The conversation engine: one conversation at a time.
 
-    heard(words)      streaming STT (or a cheat) delivers a few words at a time
-    tick()            every ~0.5 s: if something changed, ask the LLM; it replies
-                      <listening> (nothing happens) or <speaking> ... (spoken, logged)
-    event_turn(why)   the state machine needs the robot to say something now
+    heard(words)   streaming STT (or a cheat) delivers a few words at a time
+    tick()         every ~0.5 s: once the visitor pauses, ask the LLM. It replies with
+                   speech and/or a tool call; wait_for_visitor means "they're not done".
+                   After a long pause the wait tool is withdrawn, so it must reply.
+    respond()      the state machine needs the robot to say something now (e.g. the
+                   fetch_item tool result just came in: "found Jeff, hand over the pen")
+    say(text)      a fixed line, no LLM (greetings, calling someone's name)
 
 The mic is "muted" while the robot speaks: words heard then are dropped.
 """
@@ -12,12 +15,13 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import time
 from typing import Callable, Protocol
 
 from .events import EventLog
-from .llm import LLMClient, LLMError, Reply, SentenceSplitter, build_grammar, parse
-from .prompt import render_messages
+from .llm import LLMClient, LLMError, Reply, parse_message, sentences
+from .prompt import canned_line, extract_name, render_chat, tool_specs
 from .registry import Registry
 from .states import RobotState
 
@@ -27,29 +31,33 @@ class Speaker(Protocol):
     def done(self, person_id: str | None) -> None: ...             # end of one robot turn
 
 
+WAIT_NARRATION = re.compile(r"^(i'?ll )?(wait|waiting|keep listening|let(ting)? (them|the visitor) finish)\b")
+ASKS_WHICH = ("which", "would you like", "what would you", "what can i get")
+
+# get_context() -> (robot state, a note for the system prompt or None, tool names allowed now)
+Context = Callable[[], tuple[RobotState, "str | None", list[str]]]
+
+
 class Conversation:
-    def __init__(self, llm: LLMClient, log: EventLog, registry: Registry,
-                 get_robot: Callable[[], RobotState], speaker: Speaker,
-                 clock: Callable[[], float] = time.time,
+    def __init__(self, llm: LLMClient, log: EventLog, registry: Registry, get_context: Context,
+                 speaker: Speaker, clock: Callable[[], float] = time.time,
                  llm_log_path: str | pathlib.Path | None = None,
-                 milestones: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0),
-                 first_prompt_s: float = 4.0):
+                 min_pause_s: float = 0.5, force_reply_s: float = 2.5):
         self.llm, self.log, self.registry = llm, log, registry
-        self.get_robot, self.speaker, self.clock = get_robot, speaker, clock
+        self.get_context, self.speaker, self.clock = get_context, speaker, clock
         self.llm_log = pathlib.Path(llm_log_path) if llm_log_path else None
-        self.milestones = milestones
-        self.first_prompt_s = first_prompt_s   # robot just spoke and heard nothing: wait this long before asking the LLM
+        self.min_pause_s = min_pause_s          # don't ask the LLM until the visitor pauses this long
+        self.force_reply_s = force_reply_s      # after this long a pause, the LLM must reply (no wait tool)
         self.pid: str | None = None
         self.muted_until = 0.0
         self.last_spoke_end = 0.0
-        self.started = 0.0
         self.last_sig = None
         self.failures = 0
 
     # ---- lifecycle ---------------------------------------------------------------
     def start(self, pid: str) -> None:
         self.pid = pid
-        self.started = self.last_spoke_end = self.clock()
+        self.last_spoke_end = self.clock()
         self.last_sig = None
         self.failures = 0
 
@@ -73,11 +81,6 @@ class Conversation:
         return [e for e in self.log.snapshot()
                 if e.kind == "heard" and e.person_id == self.pid and e.t >= self.last_spoke_end]
 
-    def silence(self) -> float:
-        heard = self._heard_since_robot()
-        last = heard[-1].t if heard else self.last_spoke_end
-        return max(0.0, self.clock() - last)
-
     def unanswered_for(self) -> float:
         """Seconds since the robot finished speaking with no reply at all (0 if they replied)."""
         if self.pid is None or self.speaking or self._heard_since_robot():
@@ -89,72 +92,108 @@ class Conversation:
         if self.pid is None or self.speaking:
             return None
         heard = self._heard_since_robot()
-        silence = self.silence()
-        if not heard and silence < self.first_prompt_s:
-            return None                      # they haven't started replying yet
-        sig = (len(heard), sum(1 for m in self.milestones if silence >= m))
+        if not heard:
+            return None
+        pause = self.clock() - heard[-1].t
+        if pause < self.min_pause_s:
+            return None
+        forced = pause >= self.force_reply_s
+        sig = (len(heard), forced)
         if sig == self.last_sig:
             return None                      # nothing new since the last call
         self.last_sig = sig
-        return self._call("tick", None, silence)
+        return self._call(allow_wait=not forced)
 
-    def event_turn(self, reason: str) -> Reply | None:
+    def respond(self) -> Reply | None:
+        return self._call(allow_wait=False) if self.pid else None
+
+    def say(self, text: str) -> None:
+        """A fixed line (no LLM), logged like any robot turn."""
         if self.pid is None:
-            return None
-        return self._call("event", reason, None)
-
-    def _say(self, text: str) -> None:
-        duration = self.speaker.say(text, self.pid)
-        start = max(self.clock(), self.muted_until)
-        self.muted_until = start + duration
-        self.last_spoke_end = self.muted_until
-
-    def _call(self, mode: str, reason: str | None, silence: float | None) -> Reply | None:
-        pid = self.pid
-        robot = self.get_robot()
+            return
         now = self.clock()
-        messages = render_messages(self.log.snapshot(), self.registry, robot, pid, now, mode, reason, silence)
-        grammar = build_grammar(mode == "tick", robot.items_in_stock(), robot.llm_triggers())
-        splitter, text, spoken = SentenceSplitter(), "", []
+        self._speak(text)
+        self.log.append("said", self.pid, t=now, text=text)
+
+    def _speak(self, text: str) -> None:
+        for sentence in sentences(text):
+            duration = self.speaker.say(sentence, self.pid)
+            start = max(self.clock(), self.muted_until)
+            self.muted_until = start + duration
+        self.last_spoke_end = max(self.muted_until, self.clock())
+        self.speaker.done(self.pid)
+
+    def _call(self, allow_wait: bool) -> Reply | None:
+        pid = self.pid
+        robot, note, names = self.get_context()
+        names = [n for n in names if allow_wait or n != "wait_for_visitor"]
+        now = self.clock()
+        events = self.log.snapshot()
+        messages = render_chat(events, self.registry, robot, pid, now, note, names)
+        tools = tool_specs(names, robot.items_in_stock())
         t0 = time.perf_counter()
-        first_ms = None
-        stream = self.llm.stream(messages, grammar)
         try:
-            for delta in stream:
-                if first_ms is None:
-                    first_ms = round((time.perf_counter() - t0) * 1000)
-                text += delta
-                if text.lstrip().startswith("<listening"):
-                    break                    # decided: stop generating
-                for sentence in splitter.feed(delta):
-                    self._say(sentence)
-                    spoken.append(sentence)
+            msg = self.llm.chat(messages, tools or None, require_tool=bool(tools))
         except LLMError as e:
             self.failures += 1
             self.log.append("note", pid, text=f"LLM error: {e}")
             return None
-        finally:
-            stream.close()
         self.failures = 0
-        reply = parse(text)
+        reply = parse_message(msg, [t["function"]["name"] for t in tools])
+        self._validate(reply, robot, events)
+        self._learn_name(events)
 
-        if reply.kind == "speaking":
-            rest = splitter.flush() if spoken or text.startswith("<speaking>") else [reply.speech]
-            for sentence in rest:
-                self._say(sentence)
-            reply.speech = " ".join(spoken + rest)
-            self.speaker.done(pid)
-            self.log.append("said", pid, t=now, text=reply.speech, raw=reply.canonical())
-            if reply.name:
-                person = self.registry.get(pid)
-                if person and person.name != reply.name:
-                    person.name = reply.name
-                    self.log.append("person", pid, change="name", name=reply.name)
+        if reply.tool != "wait_for_visitor":
+            if not reply.speech and reply.tool:
+                reply.speech = canned_line(reply.tool, reply.args)
+            if reply.speech:
+                self._speak(reply.speech)
+            if reply.speech or reply.tool:
+                data = {"text": reply.speech}
+                if reply.tool:
+                    data.update(tool=reply.tool, args=reply.args, call_id=reply.call_id)
+                self.log.append("said", pid, t=now, **data)
 
         if self.llm_log:
             with self.llm_log.open("a") as f:
-                f.write(json.dumps({"t": now, "person": pid, "mode": mode, "reason": reason,
-                                    "messages": messages, "output": text, "reply": reply.canonical(),
-                                    "first_token_ms": first_ms,
-                                    "total_ms": round((time.perf_counter() - t0) * 1000)}) + "\n")
+                f.write(json.dumps({"t": now, "person": pid, "allow_wait": allow_wait, "messages": messages,
+                                    "tools": [t["function"]["name"] for t in tools], "output": msg,
+                                    "reply": {"speech": reply.speech, "tool": reply.tool, "args": reply.args},
+                                    "ms": round((time.perf_counter() - t0) * 1000)}) + "\n")
         return reply
+
+    def _validate(self, reply: Reply, robot: RobotState, events) -> None:
+        """Code has the last word on tool calls (each check targets a mistake measured in eval/run_eval.py)."""
+        said = reply.speech.lower()
+        if reply.tool is None and WAIT_NARRATION.match(said):
+            # The model wrote its wait out as text ("Wait for visitor to finish...") instead of calling the tool.
+            reply.tool, reply.speech = "wait_for_visitor", ""
+            return
+        if reply.tool == "fetch_item":
+            reason = None
+            if reply.args.get("item") not in robot.items_in_stock():
+                reason = "item not in stock"
+            elif "?" in said and (any(k in said for k in ASKS_WHICH)
+                                  or sum(w in said for w in ("pen", "shirt", "plushie")) >= 2):
+                reason = "its own words still ask which item"
+            if reason:
+                self.log.append("note", self.pid, text=f"rejected fetch_item {reply.args}: {reason}")
+                reply.tool, reply.args = None, {}          # keep the speech, drop the action
+
+    def _learn_name(self, events) -> None:
+        person = self.registry.get(self.pid)
+        if not person or person.name:
+            return
+        mine = [e for e in events if e.person_id == self.pid and e.kind in ("heard", "said")]
+        asked, words = False, []
+        for e in mine + [None]:
+            if e is None or e.kind == "said":
+                name = extract_name(" ".join(words), asked) if words else None
+                if name:
+                    person.name = name
+                    self.log.append("person", self.pid, change="name", name=name)
+                    return
+                words = []
+                asked = e is not None and "name" in e.data.get("text", "").lower() and "?" in e.data.get("text", "")
+            else:
+                words.append(e.data["text"])
