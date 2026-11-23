@@ -7,7 +7,7 @@ __pycache__/
 logs/
 
 # Eval output (regenerate with: uv run eval/run_eval.py)
-eval/results-*.json
+language-server/eval/results-*.json
 
 .DS_Store
 CLAUDE.md

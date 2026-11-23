@@ -51,7 +51,8 @@ class SwagBehavior(Node):
         log_dir = pathlib.Path(p("log_dir", str(pathlib.Path.home() / ".ros" / "stretch_swag")).value)
 
         self.client = LanguageClient(self.server_url)
-        self.driver = BaseDriver(self, self.cmd_vel_topic, self.odom_topic)
+        self.driver = BaseDriver(self, self.cmd_vel_topic, self.odom_topic,
+                                 linear_speed=self.drive_speed, angular_speed=self.turn_speed)
         self.state_pub = self.create_publisher(String, "/swag/state", 10)
         self.shutdown = threading.Event()
         self.state = "IDLE"
@@ -173,7 +174,7 @@ class SwagBehavior(Node):
         # answer. Turn toward it, pause (mock pickup), turn back to face the visitor.
         angle = ITEM_TURN_RAD.get(item, math.pi)
         self.set_state("FETCHING", item=item, turn_deg=round(math.degrees(angle)))
-        if not self.run_skills([("turn_to_item", lambda: self.driver.turn(angle, self.turn_speed))]):
+        if not self.run_skills([("turn_to_item", lambda: self.driver.turn(angle))]):
             return
 
         self.set_state("PICKING_UP", item=item)       # mocked: just wait
@@ -181,7 +182,7 @@ class SwagBehavior(Node):
             return
 
         self.set_state("RETURNING", item=item)
-        if not self.run_skills([("turn_to_person", lambda: self.driver.turn(-angle, self.turn_speed))]):
+        if not self.run_skills([("turn_to_person", lambda: self.driver.turn(-angle))]):
             return
 
         self.set_state("HANDOVER", item=item)          # mocked: just say it
