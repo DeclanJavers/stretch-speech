@@ -2,7 +2,8 @@
 
     ros2 launch stretch_swag sim.launch.py                      # fake base + simulated crowd + robot
     ros2 launch stretch_swag sim.launch.py fake_base:=false     # use the MuJoCo sim's /odom instead
-    ros2 launch stretch_swag sim.launch.py auto_reply:=false    # then type: ros2 run stretch_swag chat_console
+    ros2 launch stretch_swag sim.launch.py auto_reply:=true     # visitors answer by themselves (default: you type
+                                                                #   in: ros2 run stretch_swag chat_console)
     ros2 launch stretch_swag sim.launch.py world:=/path/to/crowd.json
     ros2 launch stretch_swag sim.launch.py llm_url:=http://192.168.64.1:8081/v1 face_url:=http://192.168.64.1:8100
 """
@@ -17,7 +18,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     args = {
         "fake_base": "true",
-        "auto_reply": "true",
+        "auto_reply": "false",
         "llm_url": "http://192.168.64.1:8081/v1",
         "llm_model": "lfm3-1.7b",
         "face_url": "http://192.168.64.1:8100",

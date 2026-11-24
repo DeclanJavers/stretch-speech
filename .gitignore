@@ -14,3 +14,7 @@ CLAUDE.md
 
 # Eval output (regenerate with: python3 ros/stretch_swag/eval/run_eval.py)
 ros/stretch_swag/eval/results-*.json
+ros/stretch_swag/models/*.onnx
+ros/stretch_swag/sim_faces/*.jpg
+ros/stretch_swag/sim_faces/*.jpeg
+ros/stretch_swag/sim_faces/*.png

@@ -17,11 +17,13 @@ silent (never answers), wanders_off (moves away after ordering).
 """
 
 import json
+import os
 import math
 import random
 import time
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -57,10 +59,14 @@ class SimPeople(Node):
         super().__init__("sim_people")
         from ament_index_python.packages import get_package_share_directory
         default_world = f"{get_package_share_directory('stretch_swag')}/config/world.json"
-        world_file = self.declare_parameter("world", default_world).value
+        world_file = self.declare_parameter("world", default_world).value or default_world
         self.auto_reply = self.declare_parameter("auto_reply", True).value
         self.rng = random.Random(self.declare_parameter("seed", 1).value)
         self.word_s = self.declare_parameter("word_s", 0.25).value        # time per spoken word
+        # perception:=false when the robot sees people itself (MuJoCo cutouts + camera): then we
+        # only voice the visitors, and share their positions with MuJoCo through people_file.
+        self.perception = self.declare_parameter("perception", True).value
+        self.people_file = self.declare_parameter("people_file", "").value
         world = json.loads(open(world_file).read())
         self.people = [Person(s, self.rng) for s in world["people"]]
         self.robot = None                     # (x, y, yaw)
@@ -79,7 +85,8 @@ class SimPeople(Node):
         self.create_timer(0.2, self.publish_perception)
         self.create_timer(0.05, self.step)
         names = ", ".join(f"{p.name} ({p.persona}, wants {p.wants})" for p in self.people)
-        self.get_logger().info(f"Simulated crowd: {names}. auto_reply={self.auto_reply}")
+        self.get_logger().info(f"Simulated crowd: {names}. auto_reply={self.auto_reply}, "
+                               f"perception={'faked' if self.perception else 'camera'}")
 
     # ---- inputs ------------------------------------------------------------------
     def on_odom(self, msg: Odometry) -> None:
@@ -191,8 +198,17 @@ class SimPeople(Node):
                 else:
                     p.facing = self.rng.uniform(-math.pi, math.pi)
 
+    def write_people_file(self) -> None:
+        tmp = self.people_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"positions": [[round(p.x, 3), round(p.y, 3)] for p in self.people],
+                       "names": [p.name for p in self.people]}, f)
+        os.replace(tmp, self.people_file)
+
     def publish_perception(self) -> None:
-        if not self.robot:
+        if self.people_file:
+            self.write_people_file()
+        if not self.robot or not self.perception:
             return
         rx, ry, ryaw = self.robot
         faces = []
@@ -215,12 +231,12 @@ def main():
     node = SimPeople()
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, RuntimeError):
+    except (KeyboardInterrupt, RuntimeError, ExternalShutdownException):
         pass
     finally:
         try:
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
-        except (KeyboardInterrupt, RuntimeError):
+        except (KeyboardInterrupt, RuntimeError, ExternalShutdownException):
             pass

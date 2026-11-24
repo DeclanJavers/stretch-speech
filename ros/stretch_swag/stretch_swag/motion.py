@@ -39,6 +39,29 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+NEAR_M = 0.25        # this close to the goal: stop steering, just creep along the current heading
+
+
+def drive_command(dx: float, dy: float, yaw: float, stop_distance: float, tolerance: float,
+                  max_v: float, max_w: float) -> tuple[float | None, float]:
+    """(v, w) toward a goal dx, dy away (world frame) for a robot facing yaw; (None, 0) = arrived.
+
+    Far away: turn toward the goal and drive. Near it: no more turning (steering at a goal a few
+    cm away makes the robot circle it when it overshoots); creep forward or backward along the
+    current heading until the goal is beside us (the remaining sideways error is small)."""
+    dist = math.hypot(dx, dy) - stop_distance
+    if dist <= tolerance:
+        return None, 0.0
+    if stop_distance == 0.0 and dist < NEAR_M:
+        along = dx * math.cos(yaw) + dy * math.sin(yaw)          # signed distance ahead
+        if abs(along) <= tolerance:
+            return None, 0.0
+        return math.copysign(clamp(0.8 * abs(along), 0.04, max_v), along), 0.0
+    heading_err = wrap(math.atan2(dy, dx) - yaw)
+    v = clamp(0.8 * dist, 0.05, max_v) if abs(heading_err) < 0.6 else 0.0
+    return v, clamp(2.0 * heading_err, -max_w, max_w)
+
+
 class BaseDriver:
     def __init__(self, node, cmd_vel_topic: str = "/stretch/cmd_vel", odom_topic: str = "/odom",
                  linear_speed: float = 0.3, angular_speed: float = 0.8,
@@ -185,9 +208,9 @@ class BaseDriver:
                     time.sleep(1.0 / RATE_HZ)
                     continue
                 blocked_since = None
-                heading_err = wrap(math.atan2(dy, dx) - p[2])
-                v = clamp(0.8 * dist, 0.05, self.linear_speed) if abs(heading_err) < 0.6 else 0.0
-                w = clamp(2.0 * heading_err, -self.angular_speed, self.angular_speed)
+                v, w = drive_command(dx, dy, p[2], stop_distance, tolerance, self.linear_speed, self.angular_speed)
+                if v is None:
+                    return {"success": True, "reason": ""}
                 self._publish(v, w)
                 time.sleep(1.0 / RATE_HZ)
         finally:

@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
 
@@ -78,12 +79,12 @@ def main():
     node = SpeakerNode()
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, RuntimeError):
+    except (KeyboardInterrupt, RuntimeError, ExternalShutdownException):
         pass
     finally:
         try:
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
-        except (KeyboardInterrupt, RuntimeError):
+        except (KeyboardInterrupt, RuntimeError, ExternalShutdownException):
             pass

@@ -8,6 +8,7 @@ import math
 import time
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -58,12 +59,12 @@ def main():
     node = FakeBase()
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, RuntimeError):
+    except (KeyboardInterrupt, RuntimeError, ExternalShutdownException):
         pass
     finally:
         try:
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
-        except (KeyboardInterrupt, RuntimeError):
+        except (KeyboardInterrupt, RuntimeError, ExternalShutdownException):
             pass

@@ -54,3 +54,18 @@
         use_rgb_only: False
         name: 'badge_109'
         link: 'None'
+      '200':                         # goodie bag label: pen (MEASURE: black square of the bag's tag)
+        length_mm: 50.0
+        use_rgb_only: False
+        name: 'bag_pen'
+        link: 'None'
+      '201':                         # goodie bag label: shirt (MEASURE: black square of the bag's tag)
+        length_mm: 50.0
+        use_rgb_only: False
+        name: 'bag_shirt'
+        link: 'None'
+      '202':                         # goodie bag label: plushie (MEASURE: black square of the bag's tag)
+        length_mm: 50.0
+        use_rgb_only: False
+        name: 'bag_plushie'
+        link: 'None'

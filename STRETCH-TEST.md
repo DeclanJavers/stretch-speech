@@ -18,6 +18,8 @@ ones before it work.
 
 ## 0. Before going to the lab
 
+- [ ] **Dress rehearsal in the VM** (README, "With MuJoCo"): `mujoco.launch.py stack:=false`
+      plus `robot.launch.py ... aruco:=swag motion:=true`. If this doesn't work, the robot won't.
 - [ ] **Print the badges:** `ros/stretch_swag/badges/badges_*.png`, at **100% scale** (no
       "fit to page"). Make at least 3. **Measure the black square** with a ruler; if it
       isn't 100 mm, change `length_mm` in `ros/stretch_swag/config/badges.yaml` for all ids.
@@ -26,6 +28,15 @@ ones before it work.
       Humble, the name/path of its ROS workspace, and how the head is normally pointed.
 - [ ] **Network:** the robot must reach the Mac. Lab WiFi often blocks device-to-device
       traffic. Plan B: a phone hotspot both join, or an ethernet cable.
+
+- [ ] **Optional, face recognition** (`perception:=faces`): on the robot run
+      `bash ~/stretch-speech/ros/stretch_swag/models/get_models.sh` (needs internet, ~40 MB) and
+      check `python3 -c "import cv2; print(cv2.__version__)"` is **4.8 or newer**.
+- [ ] **Optional, picking** (`pick_mode:=arm`): paper goodie bags with rope loops, each with a label
+      carrying the item name and its ArUco tag (print `badges/bag_labels.png`: 200 pen, 201 shirt, 202 plushie at
+      50 mm; print, measure, set `length_mm` for 200-202 in `config/badges.yaml`). Measure on a
+      real bag: height of the loops' top above the tag's centre (`handle_above_tag_m`, default
+      0.145) and bag depth (`bag_depth_m`, 0.10). Table: front edge ~0.5 m behind the start spot.
 
 ## 1. Mac (three terminals, from the repo folder)
 
@@ -65,7 +76,8 @@ curl http://MAC_IP:8081/v1/models && curl http://MAC_IP:8100/health && curl http
 stretch_robot_home.py                                         # once after power-on, if not homed
 ros2 launch stretch_core stretch_driver.launch.py mode:=navigation
 ros2 launch stretch_core rplidar.launch.py                    # lidar -> /scan_filtered
-ros2 launch stretch_core d435i_low_resolution.launch.py       # head camera
+ros2 launch stretch_core d435i_high_resolution.launch.py      # head camera (1280x720: badges readable to ~3 m;
+                                                              # at low resolution only to ~1.5 m)
 ```
 - [ ] **Point the head forward, level, at face height** (pan 0, tilt about 0). Ask the TA
       for their usual way (web teleop, gamepad, or a `stretch_body` script before the driver).
@@ -78,16 +90,23 @@ ros2 launch stretch_core d435i_low_resolution.launch.py       # head camera
 ```bash
 ros2 run stretch_swag lidar_check
 ```
+- [ ] It prints `lidar frame 'laser' is rotated -180 deg from the base (TF)` (Stretch's lidar is
+      mounted backwards; we read that from TF, the robot node does the same).
 - [ ] Nothing near the robot: **clear**. If it says BLOCKED with nothing there, the lidar is
       seeing the robot itself: note the distances it prints and tell us before going on.
-- [ ] Box ~0.5 m **in front** (the direction the base drives): **BLOCKED**.
-- [ ] Box ~0.5 m **behind**: clear. If front and back are swapped, rerun with
+- [ ] Box ~0.5 m **in front** (the direction the base drives): **BLOCKED**. The check is a
+      corridor as wide as the robot (±35 cm), so a box off to the side stays clear.
+- [ ] Box ~0.5 m **behind**: clear. If front and back are swapped anyway, TF is wrong: rerun with
       `--ros-args -p scan_yaw_offset:=3.1416`, and pass `scan_yaw_offset:=3.1416` to the launch below.
 
 **Badges** (start the robot stack with motion off, section 5, then):
 - [ ] Hold badge 100 at ~1.5 m in front of the camera. The `badge_faces` log says
       `badge 100 at 1.5x m, bearing ~0 deg`. Check the distance with a tape measure (±15 cm is fine).
 - [ ] Move it to your left: the bearing goes **positive**. To the right: negative.
+- [ ] Not detected, or only up close? Try our detector, which also shows what the camera sees:
+      launch with `aruco:=swag`, then `ros2 run rqt_image_view rqt_image_view /swag/camera_debug`.
+      The head camera only sees about ±21° left/right (it's mounted sideways), so the robot
+      turns in 35° steps when looking around.
 
 **Speech:**
 ```bash
@@ -117,7 +136,9 @@ Clear area of about 4 × 4 m. The **table is where the robot starts** (odometry 
 ```bash
 ros2 launch stretch_swag robot.launch.py mac_ip:=MAC_IP motion:=true
 ```
-- [ ] Robot spins slowly in place looking for badges (45° steps).
+- [ ] Robot turns slowly in place looking for badges (35° steps, pausing 1 s after each).
+      With `wander:=true` it instead turns a random amount toward open space (lidar), drives
+      0.8-2.5 m and looks; set `arena:=xmin,ymin,xmax,ymax` (odometry, metres) to fence it in.
 - [ ] Visitor at ~2 m: robot turns to face them and talks.
 - [ ] After they choose: drives back to its start spot (the "table"), pauses, drives to
       ~1 m from where they stood, calls their name, hands over.
@@ -126,6 +147,26 @@ ros2 launch stretch_swag robot.launch.py mac_ip:=MAC_IP motion:=true
 
 **Stop immediately** (runstop) if it drives toward someone without stopping, spins
 nonstop, or moves faster than walking pace. Ctrl+C on the launch also sends a stop command.
+
+## 6b. Optional: face recognition, then picking
+
+```bash
+ros2 launch stretch_swag robot.launch.py mac_ip:=MAC_IP perception:=faces           # motion off first
+ros2 run rqt_image_view rqt_image_view /swag/debug
+```
+- [ ] Faces boxed in the camera view, distances roughly right (it estimates from face size).
+- [ ] The panel on the right fills with the faces of people it met; walking away and back,
+      it recognizes you (no second entry).
+
+Picking (someone on the runstop; arm moves near the table):
+```bash
+ros2 launch stretch_swag robot.launch.py mac_ip:=MAC_IP motion:=true pick_mode:=arm table_dir_deg:=180.0
+```
+- [ ] At the start the arm goes up, gripper pointing down.
+- [ ] Ask for an item: it faces the table, finds the bag's tag, lines up beside it (arm side
+      toward the table), comes down over the loops, closes, lifts. Log: `[pick] holding the ... bag`.
+- [ ] Not verified on the real robot: whether the driver accepts arm goals in navigation mode.
+      If arm moves are rejected, tell us (fallback: `pick_mode:=mock`).
 
 ## 7. Afterwards
 

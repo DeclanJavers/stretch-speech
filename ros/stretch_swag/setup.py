@@ -27,6 +27,10 @@ setup(
             "badge_faces = stretch_swag.robot_io.badge_faces:main",
             "speaker_node = stretch_swag.robot_io.speaker_node:main",
             "lidar_check = stretch_swag.robot_io.lidar_check:main",
+            "aruco_detect = stretch_swag.robot_io.aruco_detect:main",
+            "face_detect = stretch_swag.robot_io.face_detect:main",
+            "debug_view = stretch_swag.robot_io.debug_view:main",
+            "mujoco_sim = stretch_swag.sim.mujoco_sim:main",
             "behavior = stretch_swag.behavior_node:main",   # the progress-report demo
         ],
     },

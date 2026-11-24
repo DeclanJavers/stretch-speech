@@ -189,17 +189,20 @@ def test_fetch_is_spoken_logged_and_mutes_the_mic():
 
 def test_code_checks_the_models_tool_calls():
     cases = [
-        (_msg(None, "fetch_item", '{"item": "pen", "say": "Which would you like?"}'), None),   # still asking
-        (_msg(None, "fetch_item", '{"item": "shirt", "say": "A t-shirt! Wait here."}'), None),  # out of stock
-        (_msg("Wait for the visitor to finish their sentence."), "wait_for_visitor"),           # narrated wait
-        (_msg(None, "fetch_item", '{"item": "pen"}'), "fetch_item"),
+        (_msg(None, "fetch_item", '{"item": "pen", "say": "Which would you like?"}'), "a pen", None),  # still asking
+        (_msg(None, "fetch_item", '{"item": "shirt", "say": "A t-shirt! Wait here."}'), "a shirt", None),  # no stock
+        (_msg("Wait for the visitor to finish their sentence."), "hmm", "wait_for_visitor"),          # narrated wait
+        (_msg(None, "fetch_item", '{"item": "pen", "say": "A pen it is!"}'), "hmm", None),  # they never chose
+        (_msg(None, "fetch_item", '{"item": "pen"}'), "a pen please", "fetch_item"),
     ]
-    for out, want in cases:
+    for out, heard, want in cases:
         conv, clock, speaker, llm, log, *_ = _conversation([out])
-        conv.heard("hmm")
+        conv.heard(heard)
         clock.t += 1.0
         reply = conv.tick()
-        assert reply.tool == want, out
+        assert reply.tool == want, (out, reply)
+        if heard == "hmm" and want is None:
+            assert reply.speech.startswith("Which would you like")     # asks instead of choosing for them
     assert reply.speech.startswith("Great choice!")           # fixed line when the model said nothing
     assert llm.calls[0][1] == TALK_TOOLS
 
@@ -260,8 +263,13 @@ def test_scan_obstacle_cone_and_offset():
     ranges[180] = 0.5                          # straight ahead (0 deg)
     assert scan_obstacle(ranges, amin, inc, 0.6) == 0.5
     assert scan_obstacle(ranges, amin, inc, 0.6, yaw_offset=math.pi) is None   # lidar mounted backwards
-    ranges[180], ranges[90] = 5.0, 0.4         # at -90 deg: beside the robot, outside the cone
+    ranges[180], ranges[90] = 5.0, 0.4         # at -90 deg: beside the robot, outside the path
     assert scan_obstacle(ranges, amin, inc, 0.6) is None
+    ranges[90], ranges[240] = 5.0, 0.5         # 60 deg left, 0.5 m: 0.43 m off the centre line -> clear
+    assert scan_obstacle(ranges, amin, inc, 0.6) is None
+    ranges[240], ranges[200] = 5.0, 0.5        # 20 deg left, 0.5 m: in the path, 0.47 m ahead
+    assert abs(scan_obstacle(ranges, amin, inc, 0.6) - 0.5 * math.cos(math.radians(20))) < 1e-6
+    ranges[200] = 5.0
     ranges[90] = 0.05                          # too close to be real (own body)
     assert scan_obstacle(ranges, amin, inc, 0.6) is None
 
@@ -277,3 +285,38 @@ def test_badges_and_transforms():
     assert (round(x, 6), round(y, 6), round(z, 6)) == (1.0, 1.0, 1.2)
     wx, wy = base_to_world((2.0, 1.0, math.pi / 2), 1.0, 0.0)  # robot facing +y: 1 m ahead is (2, 2)
     assert (round(wx, 6), round(wy, 6)) == (2.0, 2.0)
+
+
+def test_wander_geometry():
+    import math
+    from stretch_swag.core.geometry import arena_reach, free_distance_points, free_distance_scan
+    # a person 2 m straight ahead blocks heading 0 but not heading 90 deg
+    assert abs(free_distance_points([(2.0, 0.1)], (0, 0), 0.0) - 2.0) < 1e-6
+    assert free_distance_points([(2.0, 0.1)], (0, 0), math.pi / 2) == 10.0
+    # the same from a lidar scan: one return at angle 0, 2 m
+    ranges = [math.inf] * 360
+    ranges[180] = 2.0                                   # angle_min -pi, 1 deg steps -> index 180 = 0 rad
+    assert abs(free_distance_scan(ranges, -math.pi, math.radians(1), 0.0) - 2.0) < 1e-6
+    assert free_distance_scan(ranges, -math.pi, math.radians(1), math.pi) == 10.0
+    # lidar mounted backwards (yaw_offset pi): that return is behind the robot
+    assert free_distance_scan(ranges, -math.pi, math.radians(1), 0.0, yaw_offset=math.pi) == 10.0
+    # arena: from inside, distance to the wall; from outside pointing in, distance to the far wall
+    assert abs(arena_reach((0, 0), 0.0, (-1, -1, 3, 1)) - 3.0) < 1e-6
+    assert abs(arena_reach((0, 0), 0.0, (1, -3, 6, 3)) - 6.0) < 1e-6
+    assert arena_reach((0, 0), math.pi, (1, -3, 6, 3)) == 0.0
+
+
+def test_go_to_does_not_circle_near_the_goal():
+    import math
+    from stretch_swag.motion import drive_command
+    # far: turn toward the goal
+    v, w = drive_command(2.0, 1.0, 0.0, 0.0, 0.05, 0.3, 0.8)
+    assert v > 0 and w > 0
+    # overshot by 10 cm (goal now behind): back up straight, don't turn around
+    v, w = drive_command(-0.10, 0.02, 0.0, 0.0, 0.05, 0.3, 0.8)
+    assert v < 0 and w == 0.0
+    # beside the goal (only sideways error left): arrived
+    assert drive_command(0.01, 0.04, 0.0, 0.0, 0.05, 0.3, 0.8)[0] is None
+    # stopping short of a person still steers normally
+    v, w = drive_command(1.15, 0.3, 0.0, 1.0, 0.08, 0.3, 0.8)
+    assert v is None or w != 0.0

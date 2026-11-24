@@ -33,6 +33,12 @@ class Speaker(Protocol):
 
 WAIT_NARRATION = re.compile(r"^(i'?ll )?(wait|waiting|keep listening|let(ting)? (them|the visitor) finish)\b")
 ASKS_WHICH = ("which", "would you like", "what would you", "what can i get")
+ITEM_MENTIONS = {                      # what a visitor might say for each item (incl. paraphrases, STT slips)
+    "pen": re.compile(r"\b(pens?|write|writing|ballpoint)\b"),
+    "shirt": re.compile(r"\b(t-? ?shirts?|tee ?shirts?|tea ?shirts?|shirts?|tees?|wear|top)\b"),
+    "plushie": re.compile(r"\b(plush(ie|y|ies|es)?|stuffed|teddy|stuffy|cuddly|soft|toy)\b"),
+}
+AFFIRM = re.compile(r"\b(yes|yeah|yep|yup|sure|ok|okay|please|i'll take|that one|sounds good|why not|definitely)\b")
 WAIT_CUE = re.compile(r"\b(wait|hang on|hold on|be right back|right back|one moment|just a moment|stay)\b", re.I)
 
 # get_context() -> (robot state, a note for the system prompt or None, tool names allowed now)
@@ -187,9 +193,32 @@ class Conversation:
             elif "?" in said and (any(k in said for k in ASKS_WHICH)
                                   or sum(w in said for w in ("pen", "shirt", "plushie")) >= 2):
                 reason = "its own words still ask which item"
+            elif not self._visitor_named(reply.args.get("item"), events):
+                reason = "the visitor never named that item"
+                reply.speech = "Which would you like: a pen, a t-shirt, or a plushie?"   # they choose, not the robot
             if reason:
                 self.log.append("note", self.pid, text=f"rejected fetch_item {reply.args}: {reason}")
                 reply.tool, reply.args = None, {}          # keep the speech, drop the action
+
+    def _visitor_named(self, item: str | None, events) -> bool:
+        """Did the visitor ever say this item's name (or a word for it)? Their whole history counts:
+        "Do you still want the t-shirt?" "Yes!" after they asked for it earlier is fine."""
+        pattern = ITEM_MENTIONS.get(item)
+        if pattern is None:
+            return True
+        mine = [e for e in events if e.person_id == self.pid and e.kind in ("heard", "said")]
+        heard = " ".join(e.data.get("text", "") for e in mine if e.kind == "heard").lower()
+        if pattern.search(heard):
+            return True
+        # a yes to the robot's own question about exactly this item ("The plushie?" "Yes please!")
+        said = [i for i, e in enumerate(mine) if e.kind == "said"]
+        if said:
+            last_q = mine[said[-1]].data.get("text", "").lower()
+            after = " ".join(e.data.get("text", "") for e in mine[said[-1] + 1:] if e.kind == "heard").lower()
+            others = [p for k, p in ITEM_MENTIONS.items() if k != item]
+            return ("?" in last_q and bool(pattern.search(last_q)) and not any(p.search(last_q) for p in others)
+                    and bool(AFFIRM.search(after)))
+        return False
 
     def _learn_name(self, events) -> None:
         person = self.registry.get(self.pid)

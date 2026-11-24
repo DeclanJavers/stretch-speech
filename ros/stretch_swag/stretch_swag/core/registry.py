@@ -33,6 +33,9 @@ class Person:
     outcome: str | None = None
     face_views: int = 0
     fetch_failures: int = 0                       # times the robot came back without their item
+    thumb: str | None = None                      # small JPEG (base64) of their face, for the debug view
+    thumb_px: int = 0                             # face size it was cut from (keep the sharpest)
+    badge: int | None = None                      # ArUco badge id, when perception is badges
 
     def label(self) -> str:
         return self.name or "the visitor"
