@@ -42,12 +42,14 @@ def clamp(v: float, lo: float, hi: float) -> float:
 class BaseDriver:
     def __init__(self, node, cmd_vel_topic: str = "/stretch/cmd_vel", odom_topic: str = "/odom",
                  linear_speed: float = 0.3, angular_speed: float = 0.8,
-                 safety: Callable[[], str | None] | None = None, blocked_timeout_s: float = 15.0):
+                 safety: Callable[[], str | None] | None = None, blocked_timeout_s: float = 15.0,
+                 dry_run: bool = False):
         self.node = node
         self.pub = node.create_publisher(Twist, cmd_vel_topic, 10)
         self.linear_speed, self.angular_speed = linear_speed, angular_speed
         self.safety = safety
         self.blocked_timeout_s = blocked_timeout_s
+        self.dry_run = dry_run                # motion disabled: skills "succeed" without moving
         self.cancel = threading.Event()       # shutdown: abort everything
         self.interrupt = threading.Event()    # perception: stop the current move
         self._pose = None
@@ -91,7 +93,15 @@ class BaseDriver:
             return {"success": False, "reason": "interrupted"}
         return None
 
+    def _dry(self) -> dict | None:
+        if self.dry_run:
+            time.sleep(1.0)
+            return {"success": True, "reason": "motion disabled"}
+        return None
+
     def turn_to(self, yaw: float, tolerance: float = 0.04, timeout_s: float = 30.0) -> dict:
+        if (r := self._dry()):
+            return r
         t0 = time.monotonic()
         try:
             while True:
@@ -115,6 +125,8 @@ class BaseDriver:
 
     def turn(self, angle: float, timeout_s: float = 60.0) -> dict:
         """Relative turn, tracking accumulated rotation (works past 180 deg)."""
+        if (r := self._dry()):
+            return r
         p = self.pose()
         if p is None:
             return {"success": False, "reason": "no odometry"}
@@ -139,6 +151,8 @@ class BaseDriver:
 
     def go_to(self, x: float, y: float, stop_distance: float = 0.0, tolerance: float = 0.08,
               timeout_s: float = 120.0) -> dict:
+        if (r := self._dry()):
+            return r
         p = self.pose()
         if p is None:
             return {"success": False, "reason": "no odometry"}
@@ -181,6 +195,8 @@ class BaseDriver:
 
     def drive_distance(self, distance_m: float, speed_mps: float | None = None) -> dict:
         """Straight line, relative (used by the old demo node)."""
+        if (r := self._dry()):
+            return r
         p = self.pose()
         if p is None:
             return {"success": False, "reason": "no odometry"}

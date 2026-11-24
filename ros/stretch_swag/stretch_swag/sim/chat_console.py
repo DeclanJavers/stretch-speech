@@ -42,6 +42,9 @@ class ChatConsole(Node):
                 line = input()
             except EOFError:
                 return
+            line = line.strip()
+            if line and line[-1] not in ".?!,":  # Enter = they finished talking (real STT punctuates too)
+                line += "."
             for word in line.split():          # "..." in a line becomes a 1 s pause
                 if word.strip(".") == "" and len(word) >= 3:
                     time.sleep(1.0)

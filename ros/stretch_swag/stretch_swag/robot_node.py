@@ -28,6 +28,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 from .core.conversation import Conversation
@@ -37,6 +38,7 @@ from .core.llm import LLMClient, LLMError, Reply
 from .core.prompt import GREETINGS, ITEM_WORDS
 from .core.registry import Registry
 from .core.states import InvalidTransition, RobotState, State, Trigger, next_state
+from .core.geometry import scan_obstacle
 from .motion import BaseDriver, wrap
 
 
@@ -107,16 +109,24 @@ class SwagRobot(Node):
         self.turn_tools: list[str] = []           # tools the LLM may call right now
         self.conv = Conversation(self.llm, self.log, self.registry,
                                  lambda: (self.robot, self.turn_note, self.turn_tools), self.speaker,
-                                 llm_log_path=run_dir / "llm.jsonl")
+                                 llm_log_path=run_dir / "llm.jsonl",
+                                 mute_while_speaking=bool(p("mute_while_speaking", True)))
+        # Real robot: safety_source "scan" (the lidar). Simulation: "obstacles" (sim_people's positions).
+        self.safety_source = p("safety_source", "obstacles")
+        self.scan_yaw_offset = float(p("scan_yaw_offset", 0.0))      # robot-forward angle in the lidar frame
+        self.wander = bool(p("wander", True))                        # False: only spin in place while looking
+        self.motion_enabled = bool(p("motion_enabled", True))        # False: skills "succeed" without moving
         self.driver = BaseDriver(self, p("cmd_vel_topic", "/stretch/cmd_vel"), p("odom_topic", "/odom"),
                                  linear_speed=float(p("linear_speed", 0.3)),
-                                 angular_speed=float(p("angular_speed", 0.8)), safety=self.safety_check)
+                                 angular_speed=float(p("angular_speed", 0.8)), safety=self.safety_check,
+                                 dry_run=not self.motion_enabled)
         self.get_logger().info(f"Logging to {run_dir}")
 
         self.shutdown = threading.Event()
         self.flags_lock = threading.Lock()   # guards state changes vs. perception flags below
         self.detections: tuple[float, list[dict]] = (0.0, [])
         self.obstacles: tuple[float, list[list[float]]] = (0.0, [])
+        self.scan: tuple[float, LaserScan | None] = (0.0, None)
         self.candidate: tuple[dict, str | None] | None = None   # (face, known pid) found while looking
         self.found: dict | None = None                          # target's face found while searching
         self.last_view_t = 0.0
@@ -126,6 +136,8 @@ class SwagRobot(Node):
         self.create_subscription(String, "/swag/heard", self.on_heard, 50)
         self.create_subscription(String, "/swag/faces", self.on_faces, 10)
         self.create_subscription(String, p("obstacles_topic", "/swag/obstacles"), self.on_obstacles, 10)
+        self.create_subscription(LaserScan, p("scan_topic", "/scan_filtered"),
+                                 lambda msg: setattr(self, "scan", (time.time(), msg)), 10)
         self.state_pub = self.create_publisher(String, "/swag/state", 10)
         self.status_pub = self.create_publisher(String, "/swag/status", 10)
         self.create_timer(0.5, self.publish_status)
@@ -220,8 +232,15 @@ class SwagRobot(Node):
             pass
 
     def safety_check(self) -> str | None:
-        """Someone within safety_distance in front of the base? (stand-in for the lidar)"""
-        t, points = self.obstacles
+        """Something within safety_distance in front of the base? Called every step while driving."""
+        if self.safety_source == "scan":
+            t, scan = self.scan
+            if scan is None or time.time() - t > 0.5:
+                return "no recent lidar scan"              # can't see: don't drive
+            d = scan_obstacle(scan.ranges, scan.angle_min, scan.angle_increment, self.safety_distance,
+                              yaw_offset=self.scan_yaw_offset, min_range=max(scan.range_min, 0.15))
+            return f"obstacle {d:.2f} m ahead (lidar)" if d is not None else None
+        t, points = self.obstacles                          # simulation: sim_people's positions
         pose = self.driver.pose()
         if not pose or time.time() - t > 1.0:
             return None
@@ -279,7 +298,7 @@ class SwagRobot(Node):
     # ---- the state machine ---------------------------------------------------------
     def run(self) -> None:
         try:
-            if self.driver.wait_for_pose(30.0) is None:
+            if self.motion_enabled and self.driver.wait_for_pose(30.0) is None:
                 self.get_logger().error("No odometry on /odom after 30 s. Is the sim (or fake_base) running?")
             for name, check in (("LLM", self.llm.health), ("face service", self.faces.health)):
                 try:
@@ -342,6 +361,8 @@ class SwagRobot(Node):
             if time.time() - self.last_new_person_t > self.no_new_people_s:
                 self.fire(Trigger.NO_NEW_PEOPLE)
                 return
+            if not self.wander:                               # keep spinning in place
+                continue
             x0, y0, x1, y1 = self.arena                       # wander to a random spot
             self.driver.go_to(self.rng.uniform(x0, x1), self.rng.uniform(y0, y1))
             if self.candidate:
@@ -383,7 +404,8 @@ class SwagRobot(Node):
                 self.robot.target = None
                 self.fire(Trigger.END)
                 return
-            self.turn_note = f"You couldn't get the {item_word}. Apologize and ask if they'd like something else."
+            self.turn_note = (f"You don't have the {item_word}: picking it up failed. Apologize to {person.label()} "
+                              f"and ask if they'd like something else instead.")
             person.item = None
             first = self.conv.respond()
         elif person.outcome == "missed":
@@ -461,14 +483,14 @@ class SwagRobot(Node):
         self.conv.start(person.id)
         held = ITEM_WORDS.get(self.robot.held_item)
         call = (f"{person.name}? " if person.name else "Hello? ") + (f"I have your {held}!" if held else "I'm back!")
-        self.conv.say(call)
+        self.conv.say(call, aside=True)
         deadline, last_call = time.time() + self.search_timeout_s, time.time()
         while self.found is None and time.time() < deadline and not self.shutdown.is_set():
             self.driver.turn(math.pi / 6)
             if self.found or not self.sleep(0.5):
                 break
             if time.time() - last_call > self.recall_s:
-                self.conv.say(call)
+                self.conv.say(call, aside=True)
                 last_call = time.time()
         self.conv.stop()
         holding = self.robot.held_item is not None
@@ -502,6 +524,8 @@ class SwagRobot(Node):
         self.robot.held_item = None
         person.outcome = "served"
         self.log.append("person", person.id, change="outcome", outcome="served")
+        self.turn_note = (f"You just gave {person.label()} the {ITEM_WORDS.get(item, item)}. That's their one item, "
+                          f"so don't offer anything else; just be friendly.")
         end = time.time() + self.giving_chat_s                # a few seconds for "thank you!"
         while time.time() < end and self.sleep(self.tick_s):
             self.conv.tick()
@@ -550,7 +574,10 @@ def main() -> None:
         pass
     finally:
         node.get_logger().info("Stopping: sending zero Twist")
-        node.stop()
+        try:
+            node.stop()
+        except KeyboardInterrupt:                 # a second Ctrl+C: still try one last zero Twist
+            node.driver.stop()
         try:
             node.destroy_node()
             rclpy.shutdown()

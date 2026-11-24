@@ -42,8 +42,8 @@ You talk out loud with visitors, so keep every reply to one or two short sentenc
 SPEECH_NOTE = ("The visitor's words come from speech recognition. They can arrive before the visitor has finished "
                "speaking, and can contain errors (\"tea shirt\" means t-shirt).")
 RULES = {
-    "say_to_visitor": "- say_to_visitor: to answer or ask something. Use this when they tell you their name, say hi, "
-                      "or ask a question.",
+    "say_to_visitor": "- say_to_visitor: to answer or ask something. Use this when they only tell you their name, say "
+                      "hi, or ask a question; then ask which item they'd like (they choose, not you).",
     "fetch_item": "- fetch_item: only when they have clearly chosen one item. Its \"say\" tells them to wait right "
                   "here while you get it.",
     "wait_for_visitor": "- wait_for_visitor: their message is cut off mid-sentence; say nothing.",
@@ -174,6 +174,9 @@ def fetch_result(call: Event, events: list[Event], now: float, person: Person) -
         elif s == State.TO_PERSON:
             out.append(f"You went back to where {who} was standing{took}.")
         elif s == State.SEARCHING:
+            calls = [x.data["text"] for x in events if x.kind == "said" and e.t <= x.t <= end]
+            if calls:
+                out.append(f'You called out: "{calls[0]}"' + (f" ({len(calls)} times)" if len(calls) > 1 else "") + ".")
             if nxt in (State.GIVING, State.TALKING):
                 out.append(f"You looked around and found {who}" + (f" after {_secs(dur)}" if dur > 3 else "")
                            + ", who is right in front of you now.")
@@ -185,6 +188,12 @@ def fetch_result(call: Event, events: list[Event], now: float, person: Person) -
             prev = State(states[i - 1].data["state"])
             if prev != State.SEARCHING:                    # a missed visitor turned up again later
                 out.append(f"{_secs(e.t - states[i - 1].t).capitalize()} later, {who} is in front of you again.")
+    # Small models weigh the last sentence most, so end on what the robot is holding.
+    final = State(states[-1].data["state"])
+    if final in (State.GIVING, State.TALKING):
+        got_it = any(x.kind == "skill" and x.data.get("skill") == "pickup" and x.data.get("success") for x in events)
+        out.append(f"You're holding the {item}." if got_it and final == State.GIVING
+                   else f"You came back empty-handed: you don't have the {item}.")
     return " ".join(out)
 
 
@@ -228,6 +237,8 @@ def render_chat(events: list[Event], registry: Registry, robot: RobotState, pid:
         if e.kind == "heard":
             close_call()
             words.append((e.t, e.data["text"]))
+        elif e.kind == "said" and e.data.get("aside") and open_call:
+            open_call[1].append(e)                     # e.g. calling their name while searching: part of the fetch
         elif e.kind == "said":
             close_call()
             flush_words()

@@ -33,6 +33,7 @@ class Speaker(Protocol):
 
 WAIT_NARRATION = re.compile(r"^(i'?ll )?(wait|waiting|keep listening|let(ting)? (them|the visitor) finish)\b")
 ASKS_WHICH = ("which", "would you like", "what would you", "what can i get")
+WAIT_CUE = re.compile(r"\b(wait|hang on|hold on|be right back|right back|one moment|just a moment|stay)\b", re.I)
 
 # get_context() -> (robot state, a note for the system prompt or None, tool names allowed now)
 Context = Callable[[], tuple[RobotState, "str | None", list[str]]]
@@ -42,22 +43,24 @@ class Conversation:
     def __init__(self, llm: LLMClient, log: EventLog, registry: Registry, get_context: Context,
                  speaker: Speaker, clock: Callable[[], float] = time.time,
                  llm_log_path: str | pathlib.Path | None = None,
-                 min_pause_s: float = 0.5, force_reply_s: float = 2.5):
+                 min_pause_s: float = 0.5, force_reply_s: float = 2.5, mute_while_speaking: bool = True):
         self.llm, self.log, self.registry = llm, log, registry
         self.get_context, self.speaker, self.clock = get_context, speaker, clock
         self.llm_log = pathlib.Path(llm_log_path) if llm_log_path else None
         self.min_pause_s = min_pause_s          # don't ask the LLM until the visitor pauses this long
         self.force_reply_s = force_reply_s      # after this long a pause, the LLM must reply (no wait tool)
+        self.mute_while_speaking = mute_while_speaking   # real mic: yes (don't hear yourself); typed input: no
         self.pid: str | None = None
         self.muted_until = 0.0
-        self.last_spoke_end = 0.0
+        self.last_spoke_end = 0.0               # when the robot's last line finishes playing (estimate)
+        self.last_spoke_start = 0.0             # when it started: words after this answer it
         self.last_sig = None
         self.failures = 0
 
     # ---- lifecycle ---------------------------------------------------------------
     def start(self, pid: str) -> None:
         self.pid = pid
-        self.last_spoke_end = self.clock()
+        self.last_spoke_end = self.last_spoke_start = self.clock()
         self.last_sig = None
         self.failures = 0
 
@@ -72,14 +75,16 @@ class Conversation:
     def heard(self, text: str, t: float | None = None) -> bool:
         """Returns False if the words were dropped (no conversation, or robot speaking)."""
         t = self.clock() if t is None else t
-        if self.pid is None or t < self.muted_until or not text.strip():
+        if self.pid is None or not text.strip() or (self.mute_while_speaking and t < self.muted_until):
             return False
         self.log.append("heard", self.pid, t=t, text=text.strip())
         return True
 
     def _heard_since_robot(self):
+        # With the mic muted, nothing arrives while the robot speaks anyway; with typed input
+        # (no muting), a line typed during the robot's speech is still a reply to it.
         return [e for e in self.log.snapshot()
-                if e.kind == "heard" and e.person_id == self.pid and e.t >= self.last_spoke_end]
+                if e.kind == "heard" and e.person_id == self.pid and e.t >= self.last_spoke_start]
 
     def unanswered_for(self) -> float:
         """Seconds since the robot finished speaking with no reply at all (0 if they replied)."""
@@ -107,15 +112,17 @@ class Conversation:
     def respond(self) -> Reply | None:
         return self._call(allow_wait=False) if self.pid else None
 
-    def say(self, text: str) -> None:
-        """A fixed line (no LLM), logged like any robot turn."""
+    def say(self, text: str, aside: bool = False) -> None:
+        """A fixed line (no LLM), logged like any robot turn. aside=True: part of an ongoing action
+        (calling someone's name during a search), shown to the LLM inside that action's result."""
         if self.pid is None:
             return
         now = self.clock()
         self._speak(text)
-        self.log.append("said", self.pid, t=now, text=text)
+        self.log.append("said", self.pid, t=now, text=text, **({"aside": True} if aside else {}))
 
     def _speak(self, text: str) -> None:
+        self.last_spoke_start = self.clock()
         for sentence in sentences(text):
             duration = self.speaker.say(sentence, self.pid)
             start = max(self.clock(), self.muted_until)
@@ -145,6 +152,10 @@ class Conversation:
 
         if reply.tool != "wait_for_visitor":
             if not reply.speech and reply.tool:
+                reply.speech = canned_line(reply.tool, reply.args)
+            elif reply.tool == "fetch_item" and not WAIT_CUE.search(reply.speech):
+                # The model sometimes says a handover line ("Here is your pen!") as it leaves.
+                self.log.append("note", self.pid, text=f"fetch line had no 'wait': {reply.speech!r}")
                 reply.speech = canned_line(reply.tool, reply.args)
             if reply.speech:
                 self._speak(reply.speech)

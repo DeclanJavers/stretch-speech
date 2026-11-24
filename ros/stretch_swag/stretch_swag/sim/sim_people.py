@@ -136,7 +136,7 @@ class SimPeople(Node):
             return None
         if any(k in t for k in ("say that again", "say again", "didn't catch", "repeat")):
             return getattr(p, "last_reply", None) or "Sorry?"
-        if "name" in t and "?" in t and not p.gave_name:
+        if any(k in t for k in ("name", "call you", "who are you")) and "?" in t and not p.gave_name:
             p.gave_name = True
             return f"Oh hi! I'm {p.name}." if p.persona == "chatty" else f"I'm {p.name}."
         if any(k in t for k in ("here you go", "here's your", "here is your", "enjoy")):

@@ -91,6 +91,7 @@ def test_fetch_renders_as_a_tool_call_and_its_result():
     log.append("skill", jeff.id, t=150.0, skill="pickup", success=True)
     log.append("state", jeff.id, t=180.0, state="going_to_person", item="pen")
     log.append("state", jeff.id, t=191.0, state="searching_for_person", item="pen")
+    log.append("said", jeff.id, t=191.2, text="Jeff? I have your pen!", aside=True)   # call-out mid-search
     log.append("state", jeff.id, t=192.0, state="giving_item", item="pen")
     robot.state, robot.held_item = State.GIVING, "pen"
     msgs = render_chat(log.snapshot(), reg, robot, jeff.id, now=192.5, note="Hand them the pen.", tool_names=[])
@@ -106,6 +107,7 @@ def test_fetch_renders_as_a_tool_call_and_its_result():
     result = msgs[5]["content"]
     assert "You walked to your table (7 seconds)." in result
     assert "You picked up the pen after 2 tries (52 seconds, slower than usual)." in result
+    assert 'You called out: "Jeff? I have your pen!".' in result      # the call-out doesn't end the fetch
     assert "found Jeff, who is right in front of you now" in result
 
 
@@ -202,6 +204,20 @@ def test_code_checks_the_models_tool_calls():
     assert llm.calls[0][1] == TALK_TOOLS
 
 
+def test_typed_input_during_robot_speech_counts():
+    log, reg, robot, jeff = _setup()
+    clock, speaker = Clock(), FakeSpeaker()
+    llm = FakeLLM([_msg(None, "say_to_visitor", '{"text": "Hi Alex!"}')])
+    conv = Conversation(llm, log, reg, lambda: (robot, None, TALK_TOOLS), speaker, clock=clock,
+                        mute_while_speaking=False)
+    conv.start(jeff.id)
+    conv.say("Hello! What's your name?")              # "speaks" for ~2 s
+    clock.t += 0.5
+    assert conv.heard("I'm Alex.")                    # typed while the robot is still talking
+    clock.t += 3.0
+    assert conv.tick().speech == "Hi Alex!"
+
+
 def test_unanswered():
     conv, clock, *_ = _conversation([])
     conv.say("Hi there!")
@@ -232,3 +248,32 @@ def test_face_registry_matching():
     assert reg.identify(view("b"))["person_id"] == "p002"
     assert reg.verify("p001", view("a"))["match"] and not reg.verify("p001", view("b"))["match"]
     assert reg.identify(fs.unit([rng.gauss(0, 1) for _ in range(128)]))["person_id"] is None
+
+
+# ---- geometry (lidar safety, badge positions) -------------------------------------
+def test_scan_obstacle_cone_and_offset():
+    import math
+    from stretch_swag.core.geometry import scan_obstacle
+    ranges = [5.0] * 360                       # 1 deg per beam, starting at -180 deg
+    inc, amin = math.radians(1), -math.pi
+    assert scan_obstacle(ranges, amin, inc, 0.6) is None
+    ranges[180] = 0.5                          # straight ahead (0 deg)
+    assert scan_obstacle(ranges, amin, inc, 0.6) == 0.5
+    assert scan_obstacle(ranges, amin, inc, 0.6, yaw_offset=math.pi) is None   # lidar mounted backwards
+    ranges[180], ranges[90] = 5.0, 0.4         # at -90 deg: beside the robot, outside the cone
+    assert scan_obstacle(ranges, amin, inc, 0.6) is None
+    ranges[90] = 0.05                          # too close to be real (own body)
+    assert scan_obstacle(ranges, amin, inc, 0.6) is None
+
+
+def test_badges_and_transforms():
+    import math
+    from stretch_swag.core.geometry import badge_embedding, base_to_world, transform_point
+    a, b = badge_embedding(100), badge_embedding(101)
+    assert sum(x * y for x, y in zip(a, a)) == 1 and sum(x * y for x, y in zip(a, b)) == 0
+    # camera frame -> base: rotate 90 deg about z, then shift
+    q = (0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4))
+    x, y, z = transform_point((1.0, 0.0, 1.2), q, (1.0, 0.0, 0.0))
+    assert (round(x, 6), round(y, 6), round(z, 6)) == (1.0, 1.0, 1.2)
+    wx, wy = base_to_world((2.0, 1.0, math.pi / 2), 1.0, 0.0)  # robot facing +y: 1 m ahead is (2, 2)
+    assert (round(wx, 6), round(wy, 6)) == (2.0, 2.0)

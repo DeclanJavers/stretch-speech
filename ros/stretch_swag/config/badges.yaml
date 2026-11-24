@@ -1,0 +1,56 @@
+# Extra entries for Stretch's ArUco detector (stretch_core detect_aruco_markers): visitor badges.
+# Loaded after stretch_core's own stretch_marker_dict.yaml by launch/robot.launch.py.
+# MEASURE your printed black square and set length_mm to match (the detector uses it for distance).
+/**:
+  ros__parameters:
+    aruco_marker_info:
+      '100':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_100'
+        link: 'None'
+      '101':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_101'
+        link: 'None'
+      '102':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_102'
+        link: 'None'
+      '103':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_103'
+        link: 'None'
+      '104':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_104'
+        link: 'None'
+      '105':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_105'
+        link: 'None'
+      '106':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_106'
+        link: 'None'
+      '107':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_107'
+        link: 'None'
+      '108':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_108'
+        link: 'None'
+      '109':
+        length_mm: 100.0
+        use_rgb_only: False
+        name: 'badge_109'
+        link: 'None'

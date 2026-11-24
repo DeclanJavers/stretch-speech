@@ -6,13 +6,14 @@ fetches it from its table, finds them again and hands it over.
 - **`MASTER-PLAN.md`**: how the whole system works (state machine, triggers, LLM harness,
   where things run, work streams). Start here.
 - **`FUTURE_WORK.md`**: ideas parked for later.
+- **`STRETCH-TEST.md`**: step-by-step checklist for running v1 on the real robot.
 
 ## Layout
 
 | Folder | Runs on | What |
 |---|---|---|
 | `ros/stretch_swag/` | robot / VM (ROS 2 Humble) | everything that decides: state machine, event log, LLM harness, skills, plus simulation stand-ins |
-| `mac-service/` | Mac | LLM server (`llama-server`) and the face service |
+| `mac-service/` | Mac | LLM server (`llama-server`), face service, speech service (robot voice) |
 | `language-server/` | Mac | the earlier speech module (Whisper + Kokoro + `talk_to_person`), used for the progress-report demo |
 
 ## Run the whole loop in simulation
@@ -55,8 +56,20 @@ Watch it: `ros2 topic echo /swag/state`. Each run logs to `~/.ros/stretch_swag/r
 - `events.jsonl`: every state change, utterance, skill result
 - `llm.jsonl`: every LLM call's prompt and output
 
+## Run on the real Stretch (v1)
+
+See `STRETCH-TEST.md`. In short, with Stretch's driver, lidar and camera running:
+```bash
+ros2 launch stretch_swag robot.launch.py mac_ip:=<Mac IP>                 # motion off
+ros2 launch stretch_swag robot.launch.py mac_ip:=<Mac IP> motion:=true    # motion on
+ros2 run stretch_swag chat_console                                        # type what visitors say
+```
+Visitors wear printed ArUco badges (`ros/stretch_swag/badges/`). Also on the Mac:
+`cd language-server && uv run ../mac-service/speech_service.py` for the robot's voice.
+
 ## Tests
 
 ```bash
-cd ros/stretch_swag && python3 -m pytest test -q
+cd ros/stretch_swag && python3 -m pytest test -q          # unit tests
+python3 eval/run_eval.py                                  # LLM test set (needs the Mac's llama-server)
 ```
