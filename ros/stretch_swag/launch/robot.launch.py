@@ -5,8 +5,8 @@ the lidar and the head camera. Then:
 
     ros2 launch stretch_swag robot.launch.py mac_ip:=<Mac's IP>                    # motion OFF (default)
     ros2 launch stretch_swag robot.launch.py mac_ip:=<Mac's IP> motion:=true       # robot moves
-    ros2 launch stretch_swag robot.launch.py mac_ip:=<Mac's IP> aruco:=swag        # our badge detector
-    ros2 launch stretch_swag robot.launch.py mac_ip:=<Mac's IP> perception:=faces  # real face recognition
+    ros2 launch stretch_swag robot.launch.py mac_ip:=<Mac's IP> perception:=badges # ArUco badges instead of faces
+    ros2 launch stretch_swag robot.launch.py mac_ip:=<Mac's IP> pick_mode:=arm     # pick the coloured bags
     ros2 run rqt_image_view rqt_image_view /swag/debug                             # camera + who it knows
     ros2 run stretch_swag chat_console                                             # type what visitors say
 
@@ -30,11 +30,22 @@ def generate_launch_description():
         "motion": "false",                  # false: no movement at all, skills just "succeed"
         "wander": "false",                  # false: look for people by spinning in place only
         "speech": "auto",                   # mac (Kokoro on the Mac) | espeak (on the robot) | print | auto
-        "perception": "badges",             # badges (ArUco) | faces (YuNet + SFace on the robot's CPU)
-        "pick_mode": "mock",                # mock (pause) | arm (goodie bags with tagged labels, see pick.py)
-        "table_dir_deg": "180.0",           # heading from the start spot toward the table (180 = behind)
-        "aruco": "stretch",                 # badge detector: stretch (Stretch's own) | swag (ours: colour
-                                            # only, with a debug image on /swag/camera_debug) | none
+        "perception": "faces",              # faces (YuNet + SFace on the robot's CPU) | badges (ArUco fallback)
+        "aruco": "stretch",                 # badges only: stretch (Stretch's detector) | swag (ours)
+        "pick_mode": "mock",                # mock (pause) | arm (goodie bags in lanes, see pick.py)
+        "table_dir_deg": "180.0",           # roughly: heading from the start spot toward the table (180 = behind)
+        # the table (see STRETCH-TEST.md, "Calibrating the table"):
+        "handle_top_m": "0.78",             # MEASURE: floor -> top of a bag's rope loops (standing on the table)
+        "marker_to_edge_m": "0.45",         # MEASURE: lane marker's face -> table's front edge
+        "marker_mm": "100.0",               # MEASURE: the printed marker's black square
+        "grasp_offset_m": "0.0",            # 0: fingers around both loops (if <8 cm apart); half their spacing: the front loop
+        "clearance_m": "0.24",              # base_link -> table edge when it turns beside the table (needs >= 0.18)
+        "first_slot_m": "0.08",             # table edge -> middle of a lane's front bag (only if the colour fails)
+        "slot_pitch_m": "0.13",             # bag to bag in a lane (middle to middle; only if the colour fails)
+        "table_height_m": "0.48",           # MEASURE: table top above the floor (bag_detect)
+        "bag_height_m": "0.22",             # MEASURE: bag (without loops)
+        "bag_width_m": "0.16",              # MEASURE: along the table edge
+        "bag_depth_m": "0.10",
         "scan_topic": "/scan_filtered",
         "scan_yaw_offset": "tf",            # lidar mounting: from TF, or an angle to override (STRETCH-TEST.md)
         "linear_speed": "0.15",             # m/s
@@ -55,16 +66,24 @@ def generate_launch_description():
         stretch_dict = os.path.join(get_package_share_directory("stretch_core"), "config", "stretch_marker_dict.yaml")
         actions.append(Node(package="stretch_core", executable="detect_aruco_markers", output="screen",
                             parameters=[stretch_dict, badges_yaml],
-                            condition=IfCondition(is_("aruco", "stretch"))))
+                            condition=IfCondition(PythonExpression(["'", c["perception"], "' == 'badges' and '",
+                                                                     c["aruco"], "' == 'stretch'"]))))
     except PackageNotFoundError:
         actions.append(LogInfo(msg="stretch_core not found: use aruco:=swag"))
     actions.append(Node(package="stretch_swag", executable="aruco_detect", output="screen",
-                        parameters=[badges_yaml, {"debug_image": PythonExpression(["'", c["perception"], "' == 'badges'"])}],
-                        condition=IfCondition(is_("aruco", "swag"))))
+                        parameters=[badges_yaml],
+                        condition=IfCondition(PythonExpression(["'", c["perception"], "' == 'badges' and '",
+                                                                c["aruco"], "' == 'swag'"]))))
 
     actions += [
         Node(package="stretch_swag", executable="badge_faces", output="screen", condition=badges),
         Node(package="stretch_swag", executable="face_detect", output="screen", condition=faces),
+        Node(package="stretch_swag", executable="bag_detect", output="screen", parameters=[{
+            "table_height_m": c["table_height_m"], "bag_width_m": c["bag_width_m"], "bag_depth_m": c["bag_depth_m"],
+            "bag_height_m": c["bag_height_m"]}]),
+        Node(package="stretch_swag", executable="aruco_detect", name="lane_markers", output="screen",
+             parameters=[{"default_length_mm": c["marker_mm"], "debug_image": False, "max_hz": 10.0}],
+             remappings=[("/aruco/marker_array", "/swag/lane_markers")]),
         Node(package="stretch_swag", executable="debug_view", output="screen"),
         Node(package="stretch_swag", executable="speaker_node", output="screen",
              parameters=[{"backend": c["speech"], "mac_url": ["http://", c["mac_ip"], ":8200"]}]),
@@ -86,6 +105,9 @@ def generate_launch_description():
             "standoff": 1.0,
             "pick_mode": c["pick_mode"],
             "table_dir_deg": c["table_dir_deg"],
+            "handle_top_m": c["handle_top_m"], "marker_to_edge_m": c["marker_to_edge_m"],
+            "first_slot_m": c["first_slot_m"], "slot_pitch_m": c["slot_pitch_m"],
+            "grasp_offset_m": c["grasp_offset_m"], "clearance_m": c["clearance_m"],
         }]),
     ]
     return LaunchDescription(actions)

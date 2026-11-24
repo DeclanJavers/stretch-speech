@@ -7,7 +7,7 @@ CNNs that run on the CPU with plain OpenCV (no PyTorch). Same output as badge_fa
 
 The Mac face service then registers / identifies / verifies the embeddings (cosine similarity).
 
-Distance comes from the face's size in the image (an adult face is ~16 cm wide: set
+Distance comes from the face's size in the image (the detector's box on an adult face is ~14 cm wide: set
 face_width_m if it reads consistently long or short). Stretch's head camera is mounted sideways,
 so images are rotated upright before detection (rotate: cw | ccw | none).
 
@@ -53,7 +53,7 @@ class FaceDetect(Node):
         models = pathlib.Path(p("models_dir", str(MODELS)))
         self.rotate = p("rotate", "cw")
         self.max_hz = float(p("max_hz", 5.0))
-        self.face_width_m = float(p("face_width_m", 0.16))
+        self.face_width_m = float(p("face_width_m", 0.14))
         self.min_score = float(p("min_score", 0.75))
         self.min_face_px = int(p("min_face_px", 16))
         self.max_distance = float(p("max_distance", 7.0))

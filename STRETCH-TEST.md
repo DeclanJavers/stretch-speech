@@ -4,11 +4,11 @@
 
 | Piece | v1 on the robot |
 |---|---|
-| Finding / recognizing people | **ArUco badges** worn by visitors (Stretch's own marker detector) |
+| Finding / recognizing people | **faces** (YuNet + SFace on the robot, face service on the Mac); ArUco badges as fallback |
 | Hearing visitors | **typed** by an operator (`chat_console`) |
 | Robot speech | Kokoro voice on the Mac (or `espeak-ng` / `spd-say` on the robot as fallback) |
 | Driving | straight lines on wheel odometry, **lidar safety stop**, slow (0.15 m/s) |
-| Picking up / handover | mocked: the robot pauses at the table and "hands over" without the arm |
+| Picking up / handover | `pick_mode:=arm`: goodie bags in lanes, found by lane markers + colour, grabbed by the loops (section 6c); `pick_mode:=mock` pauses instead |
 | Conversation, state machine, logs | the real thing |
 
 Work through the stages in order. **Stop at the first failure**: each stage assumes the
@@ -19,8 +19,8 @@ ones before it work.
 ## 0. Before going to the lab
 
 - [ ] **Dress rehearsal in the VM** (README, "With MuJoCo"): `mujoco.launch.py stack:=false`
-      plus `robot.launch.py ... aruco:=swag motion:=true`. If this doesn't work, the robot won't.
-- [ ] **Print the badges:** `ros/stretch_swag/badges/badges_*.png`, at **100% scale** (no
+      plus `robot.launch.py ... motion:=true pick_mode:=arm`. If this doesn't work, the robot won't.
+- [ ] **Optional fallback, badges** (`perception:=badges`; faces are the default): `ros/stretch_swag/badges/badges_*.png`, at **100% scale** (no
       "fit to page"). Make at least 3. **Measure the black square** with a ruler; if it
       isn't 100 mm, change `length_mm` in `ros/stretch_swag/config/badges.yaml` for all ids.
 - [ ] **Push the code** so it can be pulled on the robot.
@@ -32,11 +32,9 @@ ones before it work.
 - [ ] **Optional, face recognition** (`perception:=faces`): on the robot run
       `bash ~/stretch-speech/ros/stretch_swag/models/get_models.sh` (needs internet, ~40 MB) and
       check `python3 -c "import cv2; print(cv2.__version__)"` is **4.8 or newer**.
-- [ ] **Optional, picking** (`pick_mode:=arm`): paper goodie bags with rope loops, each with a label
-      carrying the item name and its ArUco tag (print `badges/bag_labels.png`: 200 pen, 201 shirt, 202 plushie at
-      50 mm; print, measure, set `length_mm` for 200-202 in `config/badges.yaml`). Measure on a
-      real bag: height of the loops' top above the tag's centre (`handle_above_tag_m`, default
-      0.145) and bag depth (`bag_depth_m`, 0.10). Table: front edge ~0.5 m behind the start spot.
+- [ ] **Picking** (`pick_mode:=arm`): print `ros/stretch_swag/badges/lane_markers.pdf` (3 pages, at
+      **actual size**, not "fit to page") and measure the black squares (should be 100 mm). Then set up
+      the table as in **"The goodie-bag table"** below.
 
 ## 1. Mac (three terminals, from the repo folder)
 
@@ -158,15 +156,63 @@ ros2 run rqt_image_view rqt_image_view /swag/debug
 - [ ] The panel on the right fills with the faces of people it met; walking away and back,
       it recognizes you (no second entry).
 
-Picking (someone on the runstop; arm moves near the table):
+Picking (someone on the runstop; arm moves near the table). Set up the table first (next section).
 ```bash
-ros2 launch stretch_swag robot.launch.py mac_ip:=MAC_IP motion:=true pick_mode:=arm table_dir_deg:=180.0
+ros2 launch stretch_swag robot.launch.py mac_ip:=MAC_IP motion:=true pick_mode:=arm \
+    table_dir_deg:=180.0 handle_top_m:=<measured> marker_to_edge_m:=<measured>
 ```
 - [ ] At the start the arm goes up, gripper pointing down.
-- [ ] Ask for an item: it faces the table, finds the bag's tag, lines up beside it (arm side
-      toward the table), comes down over the loops, closes, lifts. Log: `[pick] holding the ... bag`.
-- [ ] Not verified on the real robot: whether the driver accepts arm goals in navigation mode.
-      If arm moves are rejected, tell us (fallback: `pick_mode:=mock`).
+- [ ] Ask for an item. In the log (`[pick] ...`), in order:
+  - `markers seen: [20, 21, 22]; table faces ...`: it found the lane markers.
+  - `driven in: ... 0.24 m from the edge`: it stands square to the lane, close to the table.
+    Check with a tape: the base's front should be ~19 cm from the table edge.
+  - `front pen bag 0.08 m in from the edge`: matches where the bag really is (tape)?
+  - `marker +0.3 cm along ...`: after turning, the marker is where it expected (a few cm off is
+    fine: that's what it corrects).
+  - `gripper at 0.12 -> holding`: it closed on the loops. `-0.21 -> empty` means it missed; it
+    backs out, looks again and retries (3 tries).
+- [ ] If the arm goes too low / too high over the loops: `handle_top_m` is off. If it reaches too
+      far / short: tell us the `front ... bag` line vs. the tape.
+- [ ] Not verified on the real robot: arm goals in navigation mode. If arm moves are rejected,
+      fallback: `pick_mode:=mock`.
+
+## 6c. The goodie-bag table
+
+Seen from the front (where the robot comes from):
+
+```
+            back of the table
+   [20]          [21]          [22]        <- markers on posts, black square 15+ cm above the loops,
+    |             |             |             facing the front, 10+ cm behind the last bag
+   pen          shirt         plushie
+   pen          shirt         plushie      <- bags one behind the other, 13 cm middle to middle
+   pen          shirt         plushie         (a 3 cm gap), loops running left-right
+  ===================================  <- front edge (front bag's middle ~8 cm in from it)
+       25 cm between lanes
+            (robot's start spot: ~0.8-1 m in front of the middle lane)
+```
+
+- Lanes **25 cm apart** (bag middles); bags **13 cm apart** inside a lane (3 cm gaps: closer, and the
+  gripper catches the next bag's loop too). Up to 3 bags per lane (the arm reaches ~50 cm).
+- Bags **red** (pen), **blue** (t-shirt), **green** (plushie): vivid colours; it measures the front
+  bag by its colour. Tape marks on the table for the bags help everyone put them back in line.
+- Markers: tape each printed marker to a stick / box so it stands upright, facing the front edge.
+  The whole black square and its white border must be visible over the bags.
+- **Measure and pass to the launch** (the defaults are the simulator's table):
+
+| Parameter | What to measure | Default |
+|---|---|---|
+| `handle_top_m` | floor to the top of a bag's rope loops (bag standing on the table) | 0.78 |
+| `marker_to_edge_m` | marker's face to the table's front edge (straight line, along the lane) | 0.45 |
+| `marker_mm` | the printed black square | 100 |
+| `table_height_m` | floor to the table top | 0.48 |
+| `bag_width_m`, `bag_height_m` | the bag (without loops), across the lane / up | 0.16, 0.22 |
+| `first_slot_m`, `slot_pitch_m` | front edge to the front bag's middle; bag to bag (only used if the colour isn't seen) | 0.08, 0.13 |
+| `table_dir_deg` | roughly which way the table is from the start spot (180 = behind the robot) | 180 |
+
+- Leave ~1 m of free floor in front of the table: the robot stops ~0.5 m out, faces the lane,
+  drives straight in to ~19 cm, then turns 90° in place (it needs ~18 cm from base_link to the table
+  edge to turn).
 
 ## 7. Afterwards
 
@@ -176,9 +222,8 @@ ros2 launch stretch_swag robot.launch.py mac_ip:=MAC_IP motion:=true pick_mode:=
 
 ## Known v1 limits (expected, not bugs)
 
-- No obstacle avoidance: it stops for obstacles but doesn't drive around them.
+- No real obstacle avoidance: it stops for obstacles, and if one stays in the way it steps aside (60-100°) and tries again.
 - Wheel odometry drifts: after a few minutes "the table" and "where Alex stood" will be off
   by tens of cm.
-- No arm motion: pickup and handover are pauses.
 - The robot only knows people by badge; someone without a badge is invisible to it.
 - Speech comes out of the Mac, not the robot (unless using the espeak fallback).

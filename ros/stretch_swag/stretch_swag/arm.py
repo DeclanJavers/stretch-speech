@@ -67,18 +67,32 @@ class Arm:
         if not self._wait(result, timeout_s):
             send.result().cancel_goal_async()
             return {"success": False, "reason": f"arm move timed out: {targets}"}
-        if result.result().status != GoalStatus.STATUS_SUCCEEDED:
-            # The MuJoCo driver aborts every goal after moving (it can't wait on the wheels).
-            # Judge by where the joints are (the gripper may be stopped by what it holds).
-            if not self._wait_joints({k: v for k, v in targets.items() if k != "gripper"}, 3.0):
-                return {"success": False, "reason": f"arm move failed: {targets}"}
+        # Don't trust "done": the MuJoCo driver can report success before the joints have moved
+        # (and aborts some goals that did move). Wait until the joints are there; the gripper until
+        # it stops moving (closed on a bag's loops it never reaches its target).
+        arrived = self._wait_joints(targets, 6.0)
+        if not arrived and result.result().status != GoalStatus.STATUS_SUCCEEDED:
+            return {"success": False, "reason": f"arm move failed: {targets}"}
         return {"success": True, "reason": ""}
 
-    def _wait_joints(self, targets: dict, timeout_s: float, tol: float = 0.03) -> bool:
-        end = time.time() + timeout_s
+    def _wait_joints(self, targets: dict, timeout_s: float) -> bool:
+        start = time.time()
+        end, last, still_since = start + timeout_s, None, None
         while time.time() < end and not self.stop.is_set():
             now = {k: self.position(k) for k in targets}
-            if all(now[k] is not None and abs(now[k] - v) < tol for k, v in targets.items()):
+            if any(v is None for v in now.values()):
+                time.sleep(0.05)
+                continue
+            there = all(abs(now[k] - v) < (0.015 if k in ("lift", "arm") else 0.04)
+                        for k, v in targets.items() if k != "gripper")
+            g = now.get("gripper")
+            if g is not None:
+                moving = last is None or abs(g - last) > 0.003
+                still_since = None if moving else (still_since or time.time())
+                last = g
+                there = there and (abs(g - targets["gripper"]) < 0.04 or
+                                   (still_since is not None and time.time() - still_since > 0.4 and time.time() - start > 1.0))
+            if there:
                 return True
             time.sleep(0.05)
         return False

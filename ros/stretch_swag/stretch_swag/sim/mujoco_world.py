@@ -9,18 +9,18 @@ Why the stock sim is slow: it traces the 360-ray lidar against ~1M mesh vertices
 on every step (0.9 ms). We compute the lidar at 15 Hz and sync status at 50 Hz instead;
 physics then runs ~10x faster than real time, so it can be paced at `SWAG_SIM_SPEED`.
 
-People are cardboard cutouts (a picture of a person wearing an ArUco badge) that always
-turn to face the robot. Their positions come from config/world.json and, while the sim
+People are cardboard cutouts (full-body photos, sim_faces/<name>.png) that always turn to
+face the robot. Their positions come from config/world.json and, while the sim
 runs, from the file sim_people writes (`SWAG_PEOPLE_FILE`), so people can walk around.
 
 Settings (environment variables, set by `mujoco_sim`):
     SWAG_SIM_SPEED      physics speed vs real time (default 1.0)
     SWAG_WORLD          crowd file (config/world.json)
     SWAG_PEOPLE_FILE    live positions written by sim_people (optional)
-    SWAG_BADGE_MM       printed size of the badges' black square (default 100)
     SWAG_CARD_DIR       where to write the cutout pictures
     SWAG_FACES_DIR      photos for the cutouts' faces: <name>.jpg/.png (e.g. Jeff.jpg), or "photo" in
-                        world.json. Without a photo a person gets a drawn face (badges only).
+                        world.json. Without a photo a person gets a drawn face.
+    SWAG_BAG_JITTER     test: move each bag up to this far (m) sideways in its lane, 1.5 cm along it (SWAG_BAG_SEED)
     SWAG_CAMERA_SCALE   head camera resolution vs the stock 424x240 (default 1.5 = 640x360;
                         the real robot's high-resolution mode is 1280x720 = 3.0)
 """
@@ -34,8 +34,6 @@ import time
 import mujoco
 import numpy as np
 
-BADGE_FIRST_ID = 100
-CARD_W, CARD_H = 0.50, 1.70            # metres
 CLOTHES = [(52, 101, 164), (170, 60, 60), (60, 140, 80), (200, 140, 40), (110, 70, 150),
            (40, 130, 140), (150, 90, 60), (90, 90, 90), (190, 80, 140), (70, 110, 60)]
 SKIN = [(241, 194, 160), (198, 134, 96), (141, 85, 54), (224, 172, 105), (255, 219, 172)]
@@ -43,7 +41,7 @@ SKIN = [(241, 194, 160), (198, 134, 96), (141, 85, 54), (224, 172, 105), (255, 2
 
 # ---- head camera resolution ----------------------------------------------------------------
 def patch_head_camera_resolution() -> None:
-    """Render the head camera bigger than the stock 424x240 (badges are unreadable past ~1.5 m
+    """Render the head camera bigger than the stock 424x240 (faces are too small past ~1.5 m
     at that size). Must run in both processes: the driver writes camera_info from these
     settings, the MuJoCo process renders with them."""
     import dataclasses
@@ -67,14 +65,14 @@ def patch_head_camera_resolution() -> None:
 
 
 # ---- people pictures -------------------------------------------------------------------
-FACE_WIDTH_M = 0.16                    # face_detect assumes this face width to estimate distance
+FACE_WIDTH_M = 0.14                    # detected face width; face_detect assumes the same to get distance
 
 
 def find_photo(name: str, explicit: str | None) -> str | None:
     if explicit and os.path.isfile(explicit):
         return explicit
     folder = os.environ.get("SWAG_FACES_DIR") or str(pathlib.Path(__file__).resolve().parents[2] / "sim_faces")
-    for ext in ("jpg", "jpeg", "png"):
+    for ext in ("png", "jpg", "jpeg"):
         for stem in (name, name.lower()):
             path = os.path.join(folder, f"{stem}.{ext}")
             if os.path.isfile(path):
@@ -82,10 +80,10 @@ def find_photo(name: str, explicit: str | None) -> str | None:
     return None
 
 
-def face_from_photo(photo: str, face_px: int):
-    """Cut the head out of a photo, scaled so the detected face is face_px wide. None if no face found."""
+def photo_card(path: str, photo: str):
+    """A full-body photo as the cutout, scaled so the face is FACE_WIDTH_M wide (a real person's
+    size). Returns (png, width_m, height_m), or None if no face is found in the photo."""
     import cv2
-    from PIL import Image
 
     img = cv2.imread(photo)
     if img is None:
@@ -95,62 +93,36 @@ def face_from_photo(photo: str, face_px: int):
     det.setInputSize((img.shape[1], img.shape[0]))
     _, faces = det.detect(img)
     if faces is None:
-        print(f"[swag] no face found in {photo}: using a drawn face", flush=True)
+        print(f"[swag] no face found in {photo}: using a drawn person", flush=True)
         return None
-    x, y, w, h = max(faces, key=lambda f: f[2])[:4]
-    s = face_px / w
-    x0, y0 = int(max(0, x - 0.45 * w)), int(max(0, y - 0.55 * h))          # head with hair, some neck
-    x1, y1 = int(min(img.shape[1], x + 1.45 * w)), int(min(img.shape[0], y + 1.35 * h))
-    head = cv2.resize(img[y0:y1, x0:x1], (max(1, int((x1 - x0) * s)), max(1, int((y1 - y0) * s))))
-    face_top = int((y - y0) * s)                                            # where the face box starts
-    return Image.fromarray(head[:, :, ::-1]), face_top, int((x - x0) * s)
+    m_per_px = FACE_WIDTH_M / max(faces, key=lambda f: f[2])[2]
+    scale = min(4.0, 1000 * m_per_px)                       # texture ~1000 px per metre (upsampled if small)
+    img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    cv2.imwrite(path, img)
+    return path, img.shape[1] / scale * m_per_px, img.shape[0] / scale * m_per_px
 
 
-def card_image(path: str, name: str, badge_id: int, badge_mm: float, index: int, photo: str | None = None) -> str:
-    """Draw a person with their ArUco badge on the chest (and their photo's face, if given)."""
-    import cv2
-    from PIL import Image, ImageDraw, ImageFont
+def drawn_card(path: str, index: int):
+    """No photo: a simple drawn person (its face is detected, but all drawn faces look alike)."""
+    from PIL import Image, ImageDraw
 
     px_per_m = 1000
-    w, h = int(CARD_W * px_per_m), int(CARD_H * px_per_m)
-    img = Image.new("RGB", (w, h), (215, 205, 185))                  # cardboard
+    w, h = int(0.5 * px_per_m), int(1.7 * px_per_m)
+    img = Image.new("RGB", (w, h), (215, 205, 185))
     d = ImageDraw.Draw(img)
     shirt, skin = CLOTHES[index % len(CLOTHES)], SKIN[index % len(SKIN)]
     cx = w // 2
     y = lambda m: int(m * px_per_m)                                   # metres from the top of the card
     d.rounded_rectangle([cx - y(0.20), y(0.30), cx + y(0.20), y(0.95)], radius=y(0.06), fill=shirt)
-    d.rounded_rectangle([cx - y(0.25), y(0.33), cx - y(0.18), y(0.90)], radius=y(0.03), fill=shirt)
-    d.rounded_rectangle([cx + y(0.18), y(0.33), cx + y(0.25), y(0.90)], radius=y(0.03), fill=shirt)
-    d.rectangle([cx - y(0.17), y(0.95), cx - y(0.02), y(1.68)], fill=(45, 50, 70))  # legs
+    d.rectangle([cx - y(0.17), y(0.95), cx - y(0.02), y(1.68)], fill=(45, 50, 70))
     d.rectangle([cx + y(0.02), y(0.95), cx + y(0.17), y(1.68)], fill=(45, 50, 70))
-    head = face_from_photo(photo, int(FACE_WIDTH_M * px_per_m)) if photo else None
-    if head:
-        pic, face_top, face_left = head
-        fx0 = cx - int(FACE_WIDTH_M * px_per_m) // 2 - face_left            # face centred on the card
-        img.paste(pic, (fx0, max(0, y(0.06) - face_top)))
-    else:
-        d.rectangle([cx - y(0.035), y(0.25), cx + y(0.035), y(0.31)], fill=skin)       # neck
-        d.ellipse([cx - y(0.10), y(0.02), cx + y(0.10), y(0.27)], fill=skin)           # head
-        d.ellipse([cx - y(0.05), y(0.10), cx - y(0.02), y(0.13)], fill=(30, 30, 30))   # eyes
-        d.ellipse([cx + y(0.02), y(0.10), cx + y(0.05), y(0.13)], fill=(30, 30, 30))
-        d.arc([cx - y(0.05), y(0.14), cx + y(0.05), y(0.21)], 20, 160, fill=(120, 40, 40), width=5)
-
-    # the badge: white card with a quiet zone, black square = badge_mm, centred on the chest
-    side = int(badge_mm / 1000 * px_per_m)
-    quiet = max(4, side // 6)
-    marker = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250),
-                                           badge_id, side)
-    top = y(0.42)
-    d.rectangle([cx - side // 2 - quiet, top - quiet, cx + side // 2 + quiet, top + side + quiet + 28],
-                fill=(255, 255, 255))
-    img.paste(Image.fromarray(marker).convert("RGB"), (cx - side // 2, top))
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 22)
-    except OSError:
-        font = ImageFont.load_default()
-    d.text((cx, top + side + 4), f"{name} #{badge_id}", fill=(0, 0, 0), font=font, anchor="mt")
+    d.rectangle([cx - y(0.035), y(0.25), cx + y(0.035), y(0.31)], fill=skin)
+    d.ellipse([cx - y(0.08), y(0.04), cx + y(0.08), y(0.26)], fill=skin)
+    d.ellipse([cx - y(0.045), y(0.11), cx - y(0.02), y(0.135)], fill=(30, 30, 30))
+    d.ellipse([cx + y(0.02), y(0.11), cx + y(0.045), y(0.135)], fill=(30, 30, 30))
+    d.arc([cx - y(0.045), y(0.15), cx + y(0.045), y(0.21)], 20, 160, fill=(120, 40, 40), width=5)
     img.save(path)
-    return path
+    return path, 0.5, 1.7
 
 
 # ---- scene ------------------------------------------------------------------------------
@@ -161,7 +133,7 @@ def load_world(path: str | None) -> list[dict]:
     return json.loads(open(path).read())["people"]
 
 
-def build_model(scene_xml: str, people: list[dict], badge_mm: float, card_dir: str) -> mujoco.MjModel:
+def build_model(scene_xml: str, people: list[dict], card_dir: str) -> mujoco.MjModel:
     """The stock scene plus one cutout per person, as mocap bodies we can move and turn."""
     card_dir = os.path.abspath(card_dir)
     os.makedirs(card_dir, exist_ok=True)
@@ -181,15 +153,15 @@ def build_model(scene_xml: str, people: list[dict], badge_mm: float, card_dir: s
     vis = getattr(spec.visual, "global")                                      # room for big camera images
     vis.offwidth, vis.offheight = max(vis.offwidth, 1920), max(vis.offheight, 1080)
     for i, p in enumerate(people):
-        badge = p.get("badge", BADGE_FIRST_ID + i)
         photo = find_photo(p["name"], p.get("photo"))
-        png = card_image(os.path.join(card_dir, f"person_{badge}.png"), p["name"], badge, badge_mm, i, photo)
+        card = photo_card(os.path.join(card_dir, f"person_{i}.png"), photo) if photo else None
+        png, card_w, card_h = card or drawn_card(os.path.join(card_dir, f"person_{i}.png"), i)
         spec.add_texture(name=f"tex_person_{i}", type=mujoco.mjtTexture.mjTEXTURE_2D, file=png)
         mat = spec.add_material(name=f"mat_person_{i}")
         mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = f"tex_person_{i}"
         x, y = p["pos"]
-        w, h = CARD_W / 2, CARD_H / 2
-        # The picture: a flat textured quad facing +x (the side we turn toward the robot).
+        w, h = card_w / 2, card_h / 2
+        # The picture: a flat textured slab facing +x (the side we turn toward the robot).
         spec.add_mesh(name=f"mesh_person_{i}",
                       uservert=[0.006, -w, -h, 0.006, w, -h, 0.006, w, h, 0.006, -w, h,     # front
                                 0.002, -w, -h, 0.002, w, -h, 0.002, w, h, 0.002, -w, h],    # back: gives it volume
@@ -206,67 +178,92 @@ def build_model(scene_xml: str, people: list[dict], badge_mm: float, card_dir: s
     return spec.compile()
 
 
-# ---- the swag table and goodie bags -------------------------------------------------------
+# ---- the swag table, goodie bags in lanes, lane markers -------------------------------------
 TABLE_CENTER = (-1.0, 0.0)             # stock table, turned: 1.2 m along y, 1.0 m deep, 0.48 m tall
 TABLE_TOP = 0.48                       # -> front edge at x = -0.5, 0.5 m behind the start spot
+TABLE_EDGE_X = TABLE_CENTER[0] + 0.5
 BAG_W, BAG_D, BAG_H = 0.16, 0.10, 0.22  # width (along the table edge), depth, height
 HANDLE_H, HANDLE_R = 0.08, 0.005       # loops rise this far above the bag; rope radius
-BAG_TAG_MM = 50
-TAGS = {"pen": 200, "shirt": 201, "plushie": 202}      # ArUco id on each item's label
-# two bags per item along the table's front edge, 12 cm in from it
-BAGS = [("pen", -0.5), ("pen", -0.3), ("shirt", -0.1), ("shirt", 0.1), ("plushie", 0.3), ("plushie", 0.5)]
-BAG_X = TABLE_CENTER[0] + 0.5 - 0.12
+# Each item's bags have their own colour (bag_detect checks it) and their own lane: a row running
+# from the table's front edge to the back, one bag behind the other. Seen from in front of the
+# table: pens on the left, t-shirts in the middle, plushies on the right.
+BAG_COLOURS = {"pen": (205, 30, 35), "shirt": (30, 70, 200), "plushie": (35, 160, 60)}   # red, blue, green
+LANES = {"pen": -0.25, "shirt": 0.0, "plushie": 0.25}  # lane centre (y); the robot faces -x at the table
+FIRST_SLOT_M, SLOT_PITCH_M = 0.08, 0.13  # table edge -> middle of the front bag; bag to bag in a lane
+BAGS_PER_LANE = 2
+# A marker (ArUco, DICT_6X6_250) on a post at the back of each lane, above the bags' loops, facing the
+# open side: the robot finds the table and the lanes by these.
+MARKER_IDS = {"pen": 20, "shirt": 21, "plushie": 22}
+MARKER_SIZE_M = 0.10                   # the black square
+MARKER_TO_EDGE_M = 0.45                # marker face -> table front edge
+MARKER_Z = 1.0                         # middle of the marker above the floor
+BAGS = [(item, y, TABLE_EDGE_X - FIRST_SLOT_M - k * SLOT_PITCH_M)
+        for item, y in LANES.items() for k in range(BAGS_PER_LANE)]
 
 
-def bag_label(path: str, item: str, tag_id: int) -> str:
-    """The bag's front: kraft paper, a white label with the item's name and its ArUco tag."""
-    import cv2
+def bag_front(path: str, item: str) -> str:
+    """The bag's front: its colour, with the item's name in white (for people; the robot uses the colour)."""
     from PIL import Image, ImageDraw, ImageFont
 
     px_per_m = 2000
     w, h = int(BAG_W * px_per_m), int(BAG_H * px_per_m)
-    img = Image.new("RGB", (w, h), (166, 120, 72))
-    d = ImageDraw.Draw(img)
-    side = int(BAG_TAG_MM / 1000 * px_per_m)
-    quiet = side // 5
-    lx0, ly0 = w // 2 - side // 2 - quiet, int(0.03 * px_per_m)
-    d.rectangle([lx0, ly0, w - lx0, ly0 + side + 2 * quiet + 60], fill=(255, 255, 255))
-    tag = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250), tag_id, side)
-    img.paste(Image.fromarray(tag).convert("RGB"), (w // 2 - side // 2, ly0 + quiet))
+    img = Image.new("RGB", (w, h), BAG_COLOURS[item])
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 44)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 46)
     except OSError:
         font = ImageFont.load_default()
-    d.text((w // 2, ly0 + side + quiet + 8), item.upper(), fill=(20, 20, 20), font=font, anchor="mt")
+    ImageDraw.Draw(img).text((w // 2, int(0.06 * px_per_m)), item.upper(), fill=(255, 255, 255), font=font,
+                             anchor="mt")
     img.save(path)
     return path
 
 
+def marker_card(path: str, marker_id: int) -> tuple[str, float]:
+    """The printed marker: the ArUco square with a white margin. Returns (png, card width in m)."""
+    import cv2
+
+    cell_px = 40                                                 # 6x6 + 1-cell black border = 8 cells
+    square = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250),
+                                           marker_id, 8 * cell_px)
+    margin = 2 * cell_px                                         # quiet zone: 2 cells of white
+    card = cv2.copyMakeBorder(square, margin, margin, margin, margin, cv2.BORDER_CONSTANT, value=255)
+    cv2.imwrite(path, cv2.cvtColor(card, cv2.COLOR_GRAY2BGR))
+    return path, MARKER_SIZE_M * card.shape[0] / square.shape[0]
+
+
+def slab(spec, name: str, x: float, w: float, h: float):
+    """A flat textured card facing +x (front at x, 1 mm thick), as a mesh with texture coordinates."""
+    spec.add_mesh(name=name,
+                  uservert=[x, -w, -h, x, w, -h, x, w, h, x, -w, h,
+                            x - 0.001, -w, -h, x - 0.001, w, -h, x - 0.001, w, h, x - 0.001, -w, h],
+                  userface=[0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1,
+                            3, 2, 6, 3, 6, 7, 0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2],
+                  usertexcoord=[0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+
 def add_bags(spec, card_dir: str) -> None:
-    """One paper goodie bag per item on the table's front edge: a free body with two white rope
-    loops on top (front and back), label + ArUco tag facing the open side (+x)."""
-    spec.add_material(name="kraft", rgba=[0.65, 0.47, 0.28, 1])
+    """Paper goodie bags in their lanes, coloured by item: a free body with two white rope loops on
+    top (front and back), the item's name on the front (+x, the open side). Plus the lane markers."""
     spec.add_material(name="rope", rgba=[0.97, 0.97, 0.97, 1])
     d, w, h = BAG_D / 2, BAG_W / 2, BAG_H / 2
-    for item, tag_id in TAGS.items():
-        png = bag_label(os.path.join(card_dir, f"bag_{item}.png"), item, tag_id)
+    for item, rgb in BAG_COLOURS.items():
+        spec.add_material(name=f"paper_{item}", rgba=[c / 255 for c in rgb] + [1])
+        png = bag_front(os.path.join(card_dir, f"bag_{item}.png"), item)
         spec.add_texture(name=f"tex_bag_{item}", type=mujoco.mjtTexture.mjTEXTURE_2D, file=png)
         mat = spec.add_material(name=f"mat_bag_{item}")
         mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = f"tex_bag_{item}"
-    for k, (item, y) in enumerate(BAGS):
+    jitter = float(os.environ.get("SWAG_BAG_JITTER", "0"))     # test: bags put down sloppily (+-m, +-yaw)
+    rng = np.random.default_rng(int(os.environ.get("SWAG_BAG_SEED", "1")))
+    for k, (item, y, x0) in enumerate(BAGS):
         name = f"{item}_{k}"
-        body = spec.worldbody.add_body(name=f"bag_{name}", pos=[BAG_X, y, TABLE_TOP + h + 0.002])
+        if jitter:
+            x0, y = x0 + rng.uniform(-0.015, 0.015), y + rng.uniform(-jitter, jitter)   # along the lane: against a tape mark
+        body = spec.worldbody.add_body(name=f"bag_{name}", pos=[x0, y, TABLE_TOP + h + 0.002])
         body.add_freejoint()
         body.add_geom(name=f"bag_{name}_body", type=mujoco.mjtGeom.mjGEOM_BOX, size=[d, w, h],
-                      material="kraft", mass=0.15, friction=[1.0, 0.01, 0.001])
-        x = d + 0.0015                                          # the label, just in front of the +x face
-        spec.add_mesh(name=f"mesh_bag_{name}",
-                      uservert=[x, -w, -h, x, w, -h, x, w, h, x, -w, h,
-                                x - 0.001, -w, -h, x - 0.001, w, -h, x - 0.001, w, h, x - 0.001, -w, h],
-                      userface=[0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1,
-                                3, 2, 6, 3, 6, 7, 0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2],
-                      usertexcoord=[0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        body.add_geom(name=f"bag_{name}_label", type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f"mesh_bag_{name}",
+                      material=f"paper_{item}", mass=0.15, friction=[1.0, 0.01, 0.001])
+        slab(spec, f"mesh_bag_{name}", d + 0.0015, w, h)          # the printed front, just in front of the +x face
+        body.add_geom(name=f"bag_{name}_front", type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f"mesh_bag_{name}",
                       material=f"mat_bag_{item}", contype=0, conaffinity=0, mass=0.0001, group=1)
         for side in (-1, 1):                                    # front and back loop
             lx, top, leg_y = side * (d - 0.012), h + HANDLE_H, 0.05
@@ -274,6 +271,19 @@ def add_bags(spec, card_dir: str) -> None:
                            [lx, -leg_y, top, lx, leg_y, top]):
                 body.add_geom(type=mujoco.mjtGeom.mjGEOM_CAPSULE, fromto=fromto, size=[HANDLE_R, 0, 0],
                               material="rope", mass=0.003, friction=[2.0, 0.05, 0.01], condim=6)
+    spec.add_material(name="post", rgba=[0.35, 0.3, 0.25, 1])
+    mx = TABLE_EDGE_X - MARKER_TO_EDGE_M
+    for item, y in LANES.items():
+        png, card_w = marker_card(os.path.join(card_dir, f"marker_{MARKER_IDS[item]}.png"), MARKER_IDS[item])
+        spec.add_texture(name=f"tex_marker_{item}", type=mujoco.mjtTexture.mjTEXTURE_2D, file=png)
+        mat = spec.add_material(name=f"mat_marker_{item}")
+        mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = f"tex_marker_{item}"
+        body = spec.worldbody.add_body(name=f"marker_{item}", pos=[mx, y, MARKER_Z])
+        slab(spec, f"mesh_marker_{item}", 0.0, card_w / 2, card_w / 2)
+        body.add_geom(name=f"marker_{item}_card", type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f"mesh_marker_{item}",
+                      material=f"mat_marker_{item}", contype=0, conaffinity=0, group=1)
+        body.add_geom(name=f"marker_{item}_post", type=mujoco.mjtGeom.mjGEOM_CYLINDER, material="post",
+                      fromto=[-0.01, 0, TABLE_TOP - MARKER_Z, -0.01, 0, -card_w / 2], size=[0.008, 0, 0])
 
 
 def face_toward(model, data, robot_xy) -> None:
@@ -296,10 +306,9 @@ class FastLoopMixin:
         if model is None:
             people = load_world(os.environ.get("SWAG_WORLD") or None)
             model = build_model(scene_xml_path or utils.default_scene_xml_path, people,
-                                float(os.environ.get("SWAG_BADGE_MM", "100")),
                                 os.environ.get("SWAG_CARD_DIR", "/tmp/stretch_swag_cards"))
             print(f"[swag] {len(people)} people in the scene: " +
-                  ", ".join(f"{p['name']} (badge {p.get('badge', BADGE_FIRST_ID + i)})" for i, p in enumerate(people)),
+                  ", ".join(f"{p['name']} ({'photo' if find_photo(p['name'], p.get('photo')) else 'drawn'})" for p in people),
                   flush=True)
         super().__init__(scene_xml_path, model, *args, **kwargs)
         self.speed = max(0.1, float(os.environ.get("SWAG_SIM_SPEED", "1.0")))

@@ -1,10 +1,9 @@
 {
-  "comment": "Virtual visitors for sim_people. Positions in the odom frame (m); the table is at the origin.",
+  "comment": "Virtual visitors for sim_people and the MuJoCo cutouts. Positions in the odom frame (m); the robot starts at the origin, the table is behind it. Photos: sim_faces/<name>.png|jpg.",
   "people": [
     {"name": "Jeff",  "pos": [3.0,  1.2], "wants": "pen",     "persona": "normal"},
     {"name": "Maria", "pos": [4.2, -1.5], "wants": "plushie", "persona": "chatty"},
     {"name": "Sam",   "pos": [2.2, -2.4], "wants": null,      "persona": "decliner"},
-    {"name": "Priya", "pos": [5.0,  2.2], "wants": "shirt",   "persona": "wanders_off"},
-    {"name": "Leo",   "pos": [5.4, -0.2], "wants": "pen",     "persona": "silent"}
+    {"name": "Leo",   "pos": [5.0,  2.2], "wants": "shirt",   "persona": "wanders_off"}
   ]
 }

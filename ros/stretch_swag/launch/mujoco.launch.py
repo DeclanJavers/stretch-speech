@@ -1,6 +1,8 @@
-"""Whole swag loop in MuJoCo with real perception: cutout people wearing ArUco badges, seen
-through the simulated head camera, and the real lidar safety stop. Everything downstream of
-the camera is what runs on the robot (aruco_detect -> badge_faces -> robot).
+"""Whole swag loop in MuJoCo with real perception: cutout people (full-body photos from
+sim_faces/) recognized by their faces through the simulated head camera, goodie bags found by
+colour in their lanes (found by the ArUco markers behind them) and picked with the arm, and the
+real lidar safety stop. Everything downstream of the
+camera is what runs on the robot (face_detect, bag_detect -> robot).
 
     ros2 launch stretch_swag mujoco.launch.py                       # 2x speed; you type the visitors' lines:
     ros2 run stretch_swag chat_console                              #   (second terminal)
@@ -10,20 +12,17 @@ the camera is what runs on the robot (aruco_detect -> badge_faces -> robot).
 
 Dress rehearsal for the real robot: MuJoCo stands in for the hardware, robot.launch.py runs on top:
     ros2 launch stretch_swag mujoco.launch.py stack:=false
-    ros2 launch stretch_swag robot.launch.py mac_ip:=192.168.64.1 aruco:=swag motion:=true
+    ros2 launch stretch_swag robot.launch.py mac_ip:=192.168.64.1 motion:=true pick_mode:=arm wander:=true arena:=1.0,-3.0,6.0,3.0
 
 See what the robot sees, and who it knows:   ros2 run rqt_image_view rqt_image_view /swag/debug
-Real face recognition instead of badges:     perception:=faces  (put photos in sim_faces/<Name>.jpg)
 Run it in the VM's desktop (the MuJoCo window needs a display). Mac services as usual.
 """
 
-import os
-
-from ament_index_python.packages import get_package_share_directory, get_package_share_path
+from ament_index_python.packages import get_package_share_path
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import Command, LaunchConfiguration, PythonExpression
+from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -37,20 +36,17 @@ def generate_launch_description():
         "llm_model": "lfm3-1.7b",
         "face_url": "http://192.168.64.1:8100",
         "world": "",                       # crowd file; empty = the package's config/world.json
-        "camera_scale": "1.5",             # head camera 424x240 x this (1.5 = 640x360)
+        "camera_scale": "2.0",             # head camera 424x240 x this (2.0 = 848x480; faces readable to ~5 m)
         "camera_hz": "10",
         "pickup_success": "1.0",
         "seed": "0",
-        "perception": "badges",            # badges (ArUco) | faces (YuNet + SFace; cutouts need photos in sim_faces/)
         "pick_mode": "arm",                # arm: pick the goodie bags for real | mock: just wait
-        "stack": "true",                   # false: only the simulated robot + visitors (run robot.launch.py on top)
+        "stack": "true",
+        "people_file": "/tmp/stretch_swag_people.json",   # where sim_people tells MuJoCo where people are                   # false: only the simulated robot + visitors (run robot.launch.py on top)
     }
     c = {k: LaunchConfiguration(k) for k in args}
-    here = get_package_share_directory("stretch_swag")
-    people_file = "/tmp/stretch_swag_people.json"
-    on = lambda value: IfCondition(PythonExpression(["'", c["stack"], "' == 'true' and '", c["perception"],  # noqa: E731
-                                                     "' == '", value, "'"]))
-    badges, faces = on("badges"), on("faces")
+    people_file = c["people_file"]
+    stack = IfCondition(c["stack"])
 
     urdf = get_package_share_path("stretch_description") / "urdf" / "stretch.urdf"
     if not urdf.is_file():
@@ -78,12 +74,13 @@ def generate_launch_description():
                              "SWAG_CAMERA_HZ": c["camera_hz"], "MUJOCO_GL": "egl"}),
 
         # --- perception: exactly the real robot's chain from the camera on ---
-        Node(package="stretch_swag", executable="aruco_detect", output="screen", condition=IfCondition(c["stack"]),
-             parameters=[os.path.join(here, "config", "badges.yaml"),          # badges and the bags' tags
-                         {"debug_image": PythonExpression(["'", c["perception"], "' == 'badges'"])}]),
-        Node(package="stretch_swag", executable="badge_faces", output="screen", condition=badges),
-        Node(package="stretch_swag", executable="face_detect", output="screen", condition=faces),
-        Node(package="stretch_swag", executable="debug_view", output="screen", condition=IfCondition(c["stack"])),
+        Node(package="stretch_swag", executable="face_detect", output="screen", condition=stack),
+        Node(package="stretch_swag", executable="bag_detect", output="screen", condition=stack,
+             parameters=[{"table_height_m": 0.48, "bag_width_m": 0.16, "bag_depth_m": 0.10, "bag_height_m": 0.22}]),
+        Node(package="stretch_swag", executable="aruco_detect", name="lane_markers", output="screen", condition=stack,
+             parameters=[{"default_length_mm": 100.0, "debug_image": False, "max_hz": 10.0}],
+             remappings=[("/aruco/marker_array", "/swag/lane_markers")]),
+        Node(package="stretch_swag", executable="debug_view", output="screen", condition=stack),
 
         # --- the visitors' voices (and where they walk, shared with MuJoCo) ---
         Node(package="stretch_swag", executable="sim_people", output="screen",
@@ -92,11 +89,13 @@ def generate_launch_description():
 
         # --- the robot ---
         Node(package="stretch_swag", executable="robot", output="screen", emulate_tty=True,
-             condition=IfCondition(c["stack"]), parameters=[{
+             condition=stack, parameters=[{
             "llm_url": c["llm_url"], "llm_model": c["llm_model"], "face_url": c["face_url"],
             "pickup_success": c["pickup_success"], "seed": c["seed"],
             "safety_source": "scan",                      # MuJoCo's simulated lidar on /scan_filtered
             "pick_mode": c["pick_mode"], "stock": "pen:2,shirt:2,plushie:2", "table_dir_deg": 180.0,
+            # the sim table (sim/mujoco_world.py): loops' top 0.48 + 0.22 + 0.08 m up; markers 0.45 m behind the edge
+            "handle_top_m": 0.78, "marker_to_edge_m": 0.45, "first_slot_m": 0.08, "slot_pitch_m": 0.13,
             "mute_while_speaking": c["auto_reply"],       # typing in chat_console: never drop lines
         }]),
     ])

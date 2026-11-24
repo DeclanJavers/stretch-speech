@@ -320,3 +320,19 @@ def test_go_to_does_not_circle_near_the_goal():
     # stopping short of a person still steers normally
     v, w = drive_command(1.15, 0.3, 0.0, 1.0, 0.08, 0.3, 0.8)
     assert v is None or w != 0.0
+
+
+def test_table_facing_from_lane_markers():
+    import math
+    from stretch_swag.core.geometry import table_facing
+    # sim layout: markers along y at x = -0.95, robot in front (x > -0.95): table faces +x
+    markers = [(-0.95, -0.25), (-0.951, 0.0), (-0.949, 0.25)]
+    assert abs(table_facing(markers, [], (0.0, 0.0))) < 0.01
+    # same markers, robot on the other side: faces -x
+    assert abs(abs(table_facing(markers, [], (-2.0, 0.0))) - math.pi) < 0.01
+    # a table at 30 deg; one marker only: its own facing
+    a = math.radians(30)
+    pts = [(math.cos(a + math.pi / 2) * k, math.sin(a + math.pi / 2) * k) for k in (-0.25, 0.0, 0.25)]
+    assert abs(table_facing(pts, [], (math.cos(a), math.sin(a))) - a) < 1e-6
+    assert abs(table_facing(pts[:1], [a + 0.02, a - 0.02], (0, 0)) - a) < 1e-6
+    assert table_facing([], [], (0, 0)) is None

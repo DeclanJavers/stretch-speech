@@ -34,7 +34,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 from tf2_ros import Buffer, TransformException, TransformListener
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Float64, String
 from visualization_msgs.msg import MarkerArray
 
 from .core.conversation import Conversation
@@ -44,10 +44,11 @@ from .core.llm import LLMClient, LLMError, Reply
 from .core.prompt import GREETINGS, ITEM_WORDS
 from .core.registry import Registry
 from .core.states import InvalidTransition, RobotState, State, Trigger, next_state
-from .core.geometry import arena_reach, free_distance_points, free_distance_scan, scan_obstacle, transform_point
+from .core.geometry import arena_reach, free_distance_points, free_distance_scan, rotate, scan_obstacle
 from .arm import Arm
 from .motion import BaseDriver, wrap, yaw_of
 from .pick import READY, Picker
+from .robot_io.locate import Locator
 
 
 def parse_pairs(text: str) -> dict[str, int]:
@@ -142,21 +143,33 @@ class SwagRobot(Node):
         self.driver = BaseDriver(self, p("cmd_vel_topic", "/stretch/cmd_vel"), p("odom_topic", "/odom"),
                                  linear_speed=float(p("linear_speed", 0.3)),
                                  angular_speed=float(p("angular_speed", 0.8)), safety=self.safety_check,
-                                 dry_run=not self.motion_enabled)
+                                 blocked_timeout_s=float(p("blocked_timeout_s", 8.0)), dry_run=not self.motion_enabled)
         self.shutdown = threading.Event()
         self.driver.docking = False                                   # True while lining up at the table
         self.docking_distance = float(p("docking_safety_distance", 0.15))
-        # Picking: "mock" (wait, configurable success rate) or "arm" (goodie bags with ArUco-tagged labels)
+        # Picking: "mock" (wait, configurable success rate) or "arm" (goodie bags in lanes, see pick.py)
         self.pick_mode = p("pick_mode", "mock")
         self.arm = Arm(self, dry_run=not self.motion_enabled, stop=self.shutdown)
-        self.markers: dict[int, list[tuple[float, str, tuple[float, float, float]]]] = {}
-        self.create_subscription(MarkerArray, "/aruco/marker_array", self.on_markers, 10)
-        self.picker = Picker(self, self.driver, self.arm, self.marker_in_base, {
-            "tags": parse_pairs(p("bag_tags", "pen:200,shirt:201,plushie:202")),
+        self.bags: tuple[float, list[dict]] = (0.0, [])               # latest /swag/bags (bag_detect)
+        self.create_subscription(String, "/swag/bags", self.on_bags, 5)
+        self.marker_obs: tuple[float, dict] = (0.0, {})              # latest lane markers seen (aruco_detect)
+        self.locator = Locator(self)
+        self.create_subscription(MarkerArray, "/swag/lane_markers", self.on_markers, 5)
+        self.table_facing_pub = self.create_publisher(Float64, "/swag/table_facing", 1)
+        self.picker = Picker(self, self.driver, self.arm, self.bags_in_base, self.markers_seen, {
             "table_dir": math.radians(float(p("table_dir_deg", 180.0))),
-            "handle_above_tag_m": float(p("handle_above_tag_m", 0.145)),
-            "bag_depth_m": float(p("bag_depth_m", 0.10)),
-        })
+            "markers": parse_pairs(p("lane_markers", "pen:20,shirt:21,plushie:22")),
+            "handle_top_m": float(p("handle_top_m", 0.78)),
+            "marker_to_edge_m": float(p("marker_to_edge_m", 0.45)),
+            "clearance_m": float(p("clearance_m", 0.24)),
+            "first_slot_m": float(p("first_slot_m", 0.08)),
+            "slot_pitch_m": float(p("slot_pitch_m", 0.13)),
+            "slots": int(p("slots", 3)),
+            "grip_depth_m": float(p("grip_depth_m", 0.04)),
+            "grasp_offset_m": float(p("grasp_offset_m", 0.0)),
+        }, on_table=lambda yaw: self.table_facing_pub.publish(Float64(data=float(yaw))))
+        self.create_timer(1.0, lambda: self.picker.facing is not None and self.table_facing_pub.publish(
+            Float64(data=float(self.picker.facing))))
         self.get_logger().info(f"Logging to {run_dir}")
 
         self.flags_lock = threading.Lock()   # guards state changes vs. perception flags below
@@ -299,28 +312,43 @@ class SwagRobot(Node):
                                    "from the base (from TF)")
         return self.scan_yaw_cache[frame]
 
-    def on_markers(self, msg: MarkerArray) -> None:
-        now, seen = time.time(), {}
-        for m in msg.markers:
-            p = m.pose.position
-            seen.setdefault(m.id, []).append((now, m.header.frame_id, (p.x, p.y, p.z)))
-        self.markers.update(seen)
+    def on_bags(self, msg: String) -> None:
+        try:
+            m = json.loads(msg.data)
+            self.bags = (m.get("stamp", time.time()), m.get("bags", []))
+        except json.JSONDecodeError:
+            pass
 
-    def marker_in_base(self, tag: int, max_age_s: float):
-        """Nearest fresh sighting of ArUco tag `tag`, in base_link (x forward, y left, z up)."""
-        best = None
-        for t, frame, point in self.markers.get(tag, []):
-            if time.time() - t > max_age_s:
+    def bags_in_base(self, item: str, since: float):
+        """That item's bags in base_link [(x, y)], from an image taken after `since` (so not while
+        the robot or head was still moving); None if there's no such image yet."""
+        t, bags = self.bags
+        if t < since:
+            return None
+        return [(b["x"], b["y"]) for b in bags if b["item"] == item]
+
+    def on_markers(self, msg: MarkerArray) -> None:
+        """Lane markers (aruco_detect): where each is in base_link and odom, and which way it faces."""
+        seen, stamp = {}, None
+        for mk in msg.markers:
+            stamp = mk.header.stamp
+            frame, pos, q = mk.header.frame_id, mk.pose.position, mk.pose.orientation
+            point = (pos.x, pos.y, pos.z)
+            base = self.locator.to_base(frame, point, stamp)
+            odom = self.locator._lookup(self.locator.odom_frame, frame, stamp)
+            if base is None or odom is None:
                 continue
-            try:
-                tf = self.tf.lookup_transform("base_link", frame, Time())
-            except TransformException:
-                continue
-            tr, r = tf.transform.translation, tf.transform.rotation
-            b = transform_point((tr.x, tr.y, tr.z), (r.x, r.y, r.z, r.w), point)
-            if best is None or math.hypot(b[0], b[1]) < math.hypot(best[0], best[1]):
-                best = b
-        return best
+            tq = odom.transform.rotation
+            nx, ny, _ = rotate((tq.x, tq.y, tq.z, tq.w), rotate((q.x, q.y, q.z, q.w), (0.0, 0.0, 1.0)))
+            ox, oy, _ = self.locator._apply(odom, point)
+            seen[mk.id] = {"base": (round(base[0], 4), round(base[1], 4)), "odom": (round(ox, 4), round(oy, 4)),
+                           "facing": math.atan2(ny, nx)}
+        if stamp is not None:
+            self.marker_obs = (stamp.sec + stamp.nanosec * 1e-9, seen)
+
+    def markers_seen(self, since: float):
+        t, seen = self.marker_obs
+        return seen if t >= since else None
 
     def safety_check(self) -> str | None:
         """Something within safety_distance in front of the base? Called every step while driving."""
@@ -537,6 +565,26 @@ class SwagRobot(Node):
             self.sleep(0.2)
         return None, None
 
+    def go_to_around(self, x: float, y: float, stop_distance: float = 0.0, detours: int = 4) -> dict:
+        """go_to, but when something stays in the way (someone standing between the robot and the
+        goal), step aside toward the more open side and try again."""
+        r = {"success": False, "reason": ""}
+        for k in range(detours + 1):
+            r = self.driver.go_to(x, y, stop_distance=stop_distance)
+            if r["success"] or not r["reason"].startswith("blocked") or k == detours:
+                return r
+            pose = self.driver.pose()
+            if pose is None:
+                return r
+            toward = math.atan2(y - pose[1], x - pose[0])
+            options = [toward + math.radians(a) for a in (60, -60, 100, -100)]
+            heading = max(options, key=lambda h: min(self.free_distance(pose, h), 1.5) - 0.1 * options.index(h))
+            if self.free_distance(pose, heading) < 1.0:
+                return r
+            self.get_logger().info(f"blocked on the way: stepping aside ({math.degrees(wrap(heading - toward)):+.0f} deg)")
+            self.driver.go_to(pose[0] + 0.7 * math.cos(heading), pose[1] + 0.7 * math.sin(heading))
+        return r
+
     def free_distance(self, pose, heading: float) -> float:
         """Open space ahead along `heading` (lidar in the real robot, sim_people's positions otherwise)."""
         if self.safety_source == "scan":
@@ -635,7 +683,7 @@ class SwagRobot(Node):
     def do_to_table(self) -> None:
         for attempt in range(1, 100):
             self.driver.interrupt.clear()
-            r = self.driver.go_to(*self.table)
+            r = self.go_to_around(*self.table)
             self.log.append("skill", self.robot.target, skill="drive to table", attempt=attempt, **r)
             if r["success"] or self.shutdown.is_set():
                 break
@@ -673,7 +721,7 @@ class SwagRobot(Node):
         x, y = person.position
         for attempt in range(1, 4):
             self.driver.interrupt.clear()
-            r = self.driver.go_to(x, y, stop_distance=self.standoff)
+            r = self.go_to_around(x, y, stop_distance=self.standoff)
             self.log.append("skill", person.id, skill="drive to person", attempt=attempt, **r)
             if r["success"] or self.shutdown.is_set():
                 break
@@ -743,7 +791,7 @@ class SwagRobot(Node):
 
     def do_returning_item(self) -> None:
         item = self.robot.held_item
-        r = self.driver.go_to(*self.table)
+        r = self.go_to_around(*self.table)
         self.log.append("skill", self.robot.target, skill="drive to table", **r)
         if self.pick_mode == "arm":
             r = self.picker.put_back(item)
@@ -757,7 +805,7 @@ class SwagRobot(Node):
         self.fire(Trigger.ARRIVED)
 
     def do_done(self) -> None:
-        self.driver.go_to(*self.table)
+        self.go_to_around(*self.table)
         self.candidate = None
         while not self.shutdown.is_set():
             if self.candidate and self.approach_candidate():

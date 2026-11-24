@@ -104,3 +104,37 @@ def arena_reach(origin: tuple[float, float], heading: float, arena: tuple[float,
         t1, t2 = (lo - o) / d, (hi - o) / d
         t_in, t_out = max(t_in, min(t1, t2)), min(t_out, max(t1, t2))
     return t_out if t_out > t_in else 0.0
+
+
+def ray_plane_z(origin, rotation, ray_cam, z: float):
+    """Where a camera ray hits the horizontal plane at height z, in the frame `origin`/`rotation`
+    describe (the camera's pose there: position, quaternion xyzw). ray_cam: direction in the camera
+    frame. None if the ray doesn't go down to that plane (in front of the camera)."""
+    d = rotate(rotation, ray_cam)
+    if abs(d[2]) < 1e-9:
+        return None
+    s = (z - origin[2]) / d[2]
+    if s <= 0:
+        return None
+    return origin[0] + s * d[0], origin[1] + s * d[1], z
+
+
+def table_facing(points: list[tuple[float, float]], normals: list[float], robot_xy: tuple[float, float]) -> float | None:
+    """Direction (yaw) from the table toward its open side, from the lane markers along its back.
+
+    Two or more markers: perpendicular to the line through them (least squares), on the robot's
+    side. One marker: its own facing (the marker's normal, from its pose; noisier). None if none."""
+    if len(points) >= 2:
+        mx = sum(p[0] for p in points) / len(points)
+        my = sum(p[1] for p in points) / len(points)
+        sxx = sum((p[0] - mx) ** 2 for p in points)
+        syy = sum((p[1] - my) ** 2 for p in points)
+        sxy = sum((p[0] - mx) * (p[1] - my) for p in points)
+        along = 0.5 * math.atan2(2 * sxy, sxx - syy)                 # direction of the line
+        facing = along + math.pi / 2
+        if (robot_xy[0] - mx) * math.cos(facing) + (robot_xy[1] - my) * math.sin(facing) < 0:
+            facing += math.pi                                     # the side the robot is on
+        return wrap(facing)
+    if normals:
+        return wrap(math.atan2(sum(math.sin(a) for a in normals), sum(math.cos(a) for a in normals)))
+    return None

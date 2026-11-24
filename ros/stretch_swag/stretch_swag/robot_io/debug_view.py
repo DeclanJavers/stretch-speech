@@ -82,6 +82,8 @@ class DebugView(Node):
         self.header = None
         self.create_subscription(Image, "/swag/camera_debug", self.on_camera, 2)
         self.create_subscription(String, "/swag/registry", self.on_registry, 2)
+        self.bags: tuple[float, dict] = (0.0, {})
+        self.create_subscription(String, "/swag/bags", lambda m: setattr(self, "bags", (time.time(), json.loads(m.data))), 2)
         self.pub = self.create_publisher(Image, "/swag/debug", 2)
         self.create_timer(0.25, self.render)
         self.get_logger().info("Debug view on /swag/debug  (ros2 run rqt_image_view rqt_image_view /swag/debug)")
@@ -99,7 +101,14 @@ class DebugView(Node):
 
     def render(self) -> None:
         if self.camera is not None and time.time() - self.camera_t < 3.0:
-            c = self.camera
+            c = self.camera.copy()
+            t, bags = self.bags
+            if time.time() - t < 1.0 and bags.get("size") == [c.shape[1], c.shape[0]]:
+                for b in bags.get("bags", []):                      # bags found by colour
+                    x, y, w, h = b["box"]
+                    cv2.rectangle(c, (x, y), (x + w, y + h), (255, 255, 255), 3)
+                    cv2.putText(c, f"{b['item']} {b['distance']:.2f}m", (x, max(14, y - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cam = cv2.resize(c, (int(c.shape[1] * H / c.shape[0]), H))
         else:
             cam = np.full((H, 405, 3), 40, np.uint8)
