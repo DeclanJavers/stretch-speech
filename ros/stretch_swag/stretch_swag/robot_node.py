@@ -51,6 +51,13 @@ from .pick import READY, Picker
 from .robot_io.locate import Locator
 
 
+MAX_FACE_VIEWS = 15         # face embeddings kept per person (the face service keeps up to 20)
+
+
+def cosine(a, b) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
 def parse_pairs(text: str) -> dict[str, int]:
     return {k.strip(): int(v) for k, v in (p.split(":") for p in text.split(",") if p.strip())}
 
@@ -147,6 +154,7 @@ class SwagRobot(Node):
         self.shutdown = threading.Event()
         self.driver.docking = False                                   # True while lining up at the table
         self.docking_distance = float(p("docking_safety_distance", 0.15))
+        self.near_table_m = float(p("near_table_m", 1.2))             # this close to the table spot: docking distance
         # Picking: "mock" (wait, configurable success rate) or "arm" (goodie bags in lanes, see pick.py)
         self.pick_mode = p("pick_mode", "mock")
         self.arm = Arm(self, dry_run=not self.motion_enabled, stop=self.shutdown)
@@ -179,6 +187,7 @@ class SwagRobot(Node):
         self.candidate: tuple[dict, str | None] | None = None   # (face, known pid) found while looking
         self.found: dict | None = None                          # target's face found while searching
         self.last_view_t = 0.0
+        self.walkup_views: list[dict] = []                        # the candidate's face, seen walking up
         self.last_new_person_t = time.time()
         self._warned: dict[str, float] = {}
 
@@ -350,9 +359,17 @@ class SwagRobot(Node):
         t, seen = self.marker_obs
         return seen if t >= since else None
 
+    def near_table(self) -> bool:
+        """Heading for (or at) the table and close to it: the table's legs are in the lidar's view
+        there, so only stop for things right in front of the base (docking distance)."""
+        if self.robot.state not in (State.TO_TABLE, State.PICKING_UP, State.RETURNING_ITEM, State.DONE):
+            return False
+        pose = self.driver.pose()
+        return pose is not None and math.hypot(pose[0] - self.table[0], pose[1] - self.table[1]) < self.near_table_m
+
     def safety_check(self) -> str | None:
         """Something within safety_distance in front of the base? Called every step while driving."""
-        stop_at = self.docking_distance if self.driver.docking else self.safety_distance
+        stop_at = self.docking_distance if (self.driver.docking or self.near_table()) else self.safety_distance
         if self.safety_source == "scan":
             t, scan = self.scan
             if scan is None or time.time() - t > 0.5:
@@ -396,6 +413,7 @@ class SwagRobot(Node):
                         pid, _ = self.faces.identify(self.face_of(det))
                         person = self.registry.get(pid)
                         if pid is None or (person and person.outcome == "missed"):
+                            self.walkup_views = [det]
                             self.set_flag(state, "candidate", (det, pid))
                             break
                 elif state == State.SEARCHING and self.found is None and self.robot.target:
@@ -407,11 +425,21 @@ class SwagRobot(Node):
                             if match:
                                 self.set_flag(state, "found", det)
                                 break
+                elif state in (State.LOOKING, State.DONE) and self.candidate is not None:
+                    # Walking up to someone new: keep their face from each distance on the way
+                    # (registered with them once they're confirmed up close, in take_candidate).
+                    target = self.candidate[0]
+                    near = [d for d in dets if math.hypot(d["x"] - target["x"], d["y"] - target["y"]) < 0.8]
+                    if near and time.time() - self.last_view_t > 0.7:
+                        self.walkup_views.append(min(near, key=lambda d: d["distance"]))
+                        self.last_view_t = time.time()
                 elif state in (State.TALKING, State.GIVING) and self.robot.target:
-                    # Add views of the person we're talking to (the closest face, straight ahead).
+                    # Add views of the person we're talking to (the closest face roughly ahead): over
+                    # a conversation they turn, lean, step back, so later they're recognized from
+                    # other angles and distances too. The face service skips near-duplicates.
                     person = self.target()
-                    close = [d for d in dets if d["distance"] < 1.8 and abs(d.get("bearing", 0)) < 0.5]
-                    if person and close and person.face_views < 6 and time.time() - self.last_view_t > 1.5:
+                    close = [d for d in dets if d["distance"] < 3.0 and abs(d.get("bearing", 0)) < 0.7]
+                    if person and close and person.face_views < MAX_FACE_VIEWS and time.time() - self.last_view_t > 1.0:
                         det = min(close, key=lambda d: d["distance"])
                         person.face_views = self.faces.register(person.id, self.face_of(det))
                         self.remember_look(person, det)
@@ -457,15 +485,21 @@ class SwagRobot(Node):
         """A face worth talking to was found: register them (if new) and turn to face them."""
         det, known = self.candidate              # stays set until fire() clears it
         self.driver.interrupt.clear()
+        self.walkup_views = [v for v in self.walkup_views if v is not det]
         if known:
             person = self.registry.get(known)
         else:
             person = self.registry.new(time.time())
             try:
                 person.face_views = self.faces.register(person.id, self.face_of(det))
-            except FaceServiceError as e:
+                # plus their face as seen walking up (farther away, other angles), if it's clearly them
+                for view in self.walkup_views[-8:]:
+                    if cosine(view["embedding"], det["embedding"]) > 0.5:
+                        person.face_views = self.faces.register(person.id, self.face_of(view))
+            except (FaceServiceError, KeyError) as e:
                 self.warn_once("faces", f"register failed: {e}")
-            self.log.append("person", person.id, change="registered")
+            self.log.append("person", person.id, change="registered", views=person.face_views)
+        self.walkup_views = []
         person.position = (det["x"], det["y"])
         self.remember_look(person, det)
         self.robot.target = person.id

@@ -20,17 +20,18 @@ import urllib.request
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 
 class SpeakerNode(Node):
     def __init__(self):
         super().__init__("speaker_node")
-        self.backend = self.declare_parameter("backend", "auto").value
+        self.backend = self.declare_parameter("backend", "espeak").value
         self.mac_url = self.declare_parameter("mac_url", "http://192.168.64.1:8200").value.rstrip("/")
         self.espeak = shutil.which("espeak-ng") or shutil.which("espeak") or shutil.which("spd-say")
         self.lines: queue.Queue = queue.Queue()
         self.create_subscription(String, "/swag/say", self.on_say, 50)
+        self.speaking = self.create_publisher(Bool, "/swag/speaking", 10)   # mic_node ignores the mic meanwhile
         threading.Thread(target=self.worker, daemon=True).start()
         self.get_logger().info(f"Speaker: backend={self.backend}, espeak={self.espeak or 'not installed'}")
 
@@ -47,9 +48,14 @@ class SpeakerNode(Node):
                  "espeak": ["espeak", "print"], "print": ["print"]}.get(self.backend, ["print"])
         while rclpy.ok():
             text = self.lines.get()
-            for backend in order:
-                if getattr(self, f"say_{backend}")(text):
-                    break
+            self.speaking.publish(Bool(data=True))
+            try:
+                for backend in order:
+                    if getattr(self, f"say_{backend}")(text):
+                        break
+            finally:
+                if self.lines.empty():
+                    self.speaking.publish(Bool(data=False))
 
     def say_mac(self, text: str) -> bool:
         req = urllib.request.Request(self.mac_url + "/say", data=json.dumps({"text": text}).encode(),

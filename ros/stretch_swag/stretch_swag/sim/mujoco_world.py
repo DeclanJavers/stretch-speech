@@ -373,7 +373,9 @@ class FastLoopMixin:
                     p = d.xpos[i]
                     if np.linalg.norm(p - bag_seen[i]) > 0.05:
                         bag_seen[i] = p.copy()
-                        print(f"[swag] {m.body(i).name} now at ({p[0]:.2f}, {p[1]:.2f}), {p[2]:.2f} m up", flush=True)
+                        b = d.body("base_link").xpos
+                        print(f"[swag] {time.strftime('%H:%M:%S')} {m.body(i).name} now at ({p[0]:.2f}, {p[1]:.2f}), "
+                              f"{p[2]:.2f} m up (robot at {b[0]:.2f}, {b[1]:.2f})", flush=True)
             ahead = (d.time - sim0) / self.speed - (time.perf_counter() - wall0)
             if ahead > 0:
                 time.sleep(ahead)

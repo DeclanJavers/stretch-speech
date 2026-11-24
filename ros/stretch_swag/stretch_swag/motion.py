@@ -25,6 +25,7 @@ from nav_msgs.msg import Odometry
 
 RATE_HZ = 20.0
 ODOM_STALE_S = 1.0
+CLEAR_S = 1.0        # after being blocked, the way must stay clear this long before driving on
 
 
 def yaw_of(q) -> float:
@@ -185,7 +186,8 @@ class BaseDriver:
         if not r["success"]:
             return r
         t0 = time.monotonic()
-        blocked_since = None
+        blocked_since = clear_since = None
+        last_reason = ""
         try:
             while True:
                 if (r := self._aborted()):
@@ -200,14 +202,22 @@ class BaseDriver:
                 if time.monotonic() - t0 > timeout_s:
                     return {"success": False, "reason": "go_to timeout"}
                 reason = self.safety() if self.safety else None
-                if reason:
+                now = time.monotonic()
+                if reason or (blocked_since is not None and now - (clear_since or now) < CLEAR_S):
+                    # Blocked, or not clear for long enough yet: a reading flickering at the edge of
+                    # the safety distance must not make the robot inch forward (nor reset the timeout).
                     self._publish(0.0, 0.0)
-                    blocked_since = blocked_since or time.monotonic()
-                    if time.monotonic() - blocked_since > self.blocked_timeout_s:
-                        return {"success": False, "reason": f"blocked: {reason}"}
+                    if reason:
+                        clear_since = None
+                        last_reason = reason
+                    else:
+                        clear_since = clear_since or now
+                    blocked_since = blocked_since or now
+                    if now - blocked_since > self.blocked_timeout_s:
+                        return {"success": False, "reason": f"blocked: {last_reason}"}
                     time.sleep(1.0 / RATE_HZ)
                     continue
-                blocked_since = None
+                blocked_since = clear_since = None
                 v, w = drive_command(dx, dy, p[2], stop_distance, tolerance, self.linear_speed, self.angular_speed)
                 if v is None:
                     return {"success": True, "reason": ""}

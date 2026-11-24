@@ -164,13 +164,14 @@ ros2 launch stretch_swag robot.launch.py mac_ip:=MAC_IP motion:=true pick_mode:=
 - [ ] At the start the arm goes up, gripper pointing down.
 - [ ] Ask for an item. In the log (`[pick] ...`), in order:
   - `markers seen: [20, 21, 22]; table faces ...`: it found the lane markers.
-  - `driven in: ... 0.24 m from the edge`: it stands square to the lane, close to the table.
+  - `driven in: ... 0.24 m from the edge`: it squared up to the table and drove straight in.
     Check with a tape: the base's front should be ~19 cm from the table edge.
-  - `front pen bag 0.08 m in from the edge`: matches where the bag really is (tape)?
-  - `marker +0.3 cm along ...`: after turning, the marker is where it expected (a few cm off is
-    fine: that's what it corrects).
-  - `gripper at 0.12 -> holding`: it closed on the loops. `-0.21 -> empty` means it missed; it
-    backs out, looks again and retries (3 tries).
+  - `marker +0.3 cm along ...` (once or twice): it turned its arm side to the table and drove
+    along it to the lane, checking on the marker (a few cm off is fine: that's what it corrects).
+  - `front pen bag 0.08 m in from the edge`: it lowered the lift and looked down the lane.
+    Matches where the bag really is (tape)?
+  - `gripper at 0.10 -> holding`: the fingers stopped on the bag. `-0.21 -> empty` (or lower)
+    means they closed all the way on nothing; it opens, pulls in, looks again, retries (3 tries).
 - [ ] If the arm goes too low / too high over the loops: `handle_top_m` is off. If it reaches too
       far / short: tell us the `front ... bag` line vs. the tape.
 - [ ] Not verified on the real robot: arm goals in navigation mode. If arm moves are rejected,
@@ -192,6 +193,9 @@ Seen from the front (where the robot comes from):
             (robot's start spot: ~0.8-1 m in front of the middle lane)
 ```
 
+- **Table height:** Stretch's lift reaches ~1.1 m, so the top of the bags' loops must be below
+  ~0.93 m (the robot warns at start-up if `handle_top_m` is higher). A normal 74 cm table with 30 cm
+  bags is too high: use a low table (coffee table, ~45-60 cm) or a low shelf/box on the floor.
 - Lanes **25 cm apart** (bag middles); bags **13 cm apart** inside a lane (3 cm gaps: closer, and the
   gripper catches the next bag's loop too). Up to 3 bags per lane (the arm reaches ~50 cm).
 - Bags **red** (pen), **blue** (t-shirt), **green** (plushie): vivid colours; it measures the front
@@ -210,9 +214,24 @@ Seen from the front (where the robot comes from):
 | `first_slot_m`, `slot_pitch_m` | front edge to the front bag's middle; bag to bag (only used if the colour isn't seen) | 0.08, 0.13 |
 | `table_dir_deg` | roughly which way the table is from the start spot (180 = behind the robot) | 180 |
 
-- Leave ~1 m of free floor in front of the table: the robot stops ~0.5 m out, faces the lane,
-  drives straight in to ~19 cm, then turns 90° in place (it needs ~18 cm from base_link to the table
-  edge to turn).
+- Leave ~1 m of free floor in front of the table. From the table spot the robot squares up to the
+  table, drives straight in to ~19 cm, turns 90° in place (it needs ~18 cm from base_link to the
+  table edge to turn), then drives along the table to the lane.
+
+**Tune the grasp on the real bags first, without the conversation** (someone on the runstop; robot at
+the table spot; Stretch's driver + camera running, and `robot.launch.py ... pick_mode:=arm` or at least
+its `bag_detect` + `lane_markers` nodes):
+```bash
+ros2 run stretch_swag pick_test pen                  # pick, hold 3 s, put back; then shirt, plushie
+ros2 run stretch_swag pick_test pen --ros-args -p handle_top_m:=0.81 -p grip_depth_m:=0.05 -p grasp_offset_m:=0.0
+```
+- The gripper comes down open, centred on the bag's middle (`grasp_offset_m` moves it toward the
+  robot), and closes **all the way** `grip_depth_m` below the loops' top. In the sim that pinches the bag's top edge with
+  both loops between the fingers. The real gripper opens only ~9-12 cm: if the bag is deeper than
+  that, try `grasp_offset_m` = half the bag's depth (pinch the front wall with its handle,
+  one finger inside the bag) and `grip_depth_m` = handle height + 3 cm.
+- Then pass the same values to `robot.launch.py` (`grasp_offset_m:=... grip_depth_m:=...`).
+
 
 ## 7. Afterwards
 

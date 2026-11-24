@@ -336,3 +336,37 @@ def test_table_facing_from_lane_markers():
     assert abs(table_facing(pts, [], (math.cos(a), math.sin(a))) - a) < 1e-6
     assert abs(table_facing(pts[:1], [a + 0.02, a - 0.02], (0, 0)) - a) < 1e-6
     assert table_facing([], [], (0, 0)) is None
+
+
+def test_go_to_does_not_inch_forward_when_the_obstacle_reading_flickers():
+    import math
+    import time as _time
+    from stretch_swag import motion
+
+    class FakeNode:
+        def create_publisher(self, *a, **k):
+            return None
+
+        def create_subscription(self, *a, **k):
+            return None
+
+    calls = {"n": 0}
+
+    def flicker():                              # something right at the edge of the safety distance
+        calls["n"] += 1
+        return "obstacle 0.60 m ahead" if calls["n"] % 2 else None
+
+    d = motion.BaseDriver(FakeNode(), safety=flicker, blocked_timeout_s=0.5)
+    state = {"pose": (0.0, 0.0, 0.0), "t": _time.monotonic(), "moving_after_block": 0}
+    d.pose = lambda: state["pose"]
+
+    def publish(v, w):
+        if calls["n"] > 1 and v > 0:
+            state["moving_after_block"] += 1
+        x, y, th = state["pose"]
+        state["pose"] = (x + v * 0.05 * math.cos(th), y + v * 0.05 * math.sin(th), th + w * 0.05)
+
+    d._publish = publish
+    r = d.go_to(2.0, 0.0)
+    assert not r["success"] and r["reason"].startswith("blocked")
+    assert state["moving_after_block"] == 0
