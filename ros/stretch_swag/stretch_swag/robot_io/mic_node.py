@@ -34,8 +34,9 @@ class MicNode(Node):
         self.device = p("device", "default")
         self.ratio = float(p("start_ratio", 3.0))         # speech = this many times louder than the noise
         self.min_level = float(p("min_level", 300.0))     # ...and at least this loud (int16 RMS)
-        self.end_silence_s = float(p("end_silence_s", 0.8))
-        self.max_s = float(p("max_utterance_s", 12.0))
+        self.end_silence_s = float(p("end_silence_s", 0.6))
+        self.max_s = float(p("max_utterance_s", 8.0))
+        self.end_fraction = float(p("end_fraction", 0.2))  # quieter than this x the utterance's peak = pause
         self.echo_s = float(p("echo_s", 0.6))
         self.pub = self.create_publisher(String, "/swag/heard", 10)
         self.level_pub = self.create_publisher(String, "/swag/mic_level", 10)
@@ -68,7 +69,7 @@ class MicNode(Node):
             time.sleep(2.0)
 
     def listen(self, proc) -> None:
-        noise, recorded, speaking, last_loud, started, last_report = 200.0, [], False, 0.0, 0.0, 0.0
+        noise, recorded, speaking, last_loud, started, last_report, peak = 200.0, [], False, 0.0, 0.0, 0.0, 0.0
         preroll: list[bytes] = []
         while rclpy.ok():
             data = proc.stdout.read(CHUNK * 2)
@@ -87,13 +88,18 @@ class MicNode(Node):
                 noise = 0.97 * noise + 0.03 * min(level, noise * 2)      # follow the room, not the voices
                 preroll = (preroll + [data])[-10:]                       # 0.3 s before the start
                 if loud:
-                    speaking, started, last_loud, recorded = True, now, now, preroll[:]
+                    speaking, started, last_loud, recorded, peak = True, now, now, preroll[:], level
                 continue
             recorded.append(data)
-            if loud:
+            peak = max(peak, level)
+            # still talking = loud against the room AND not far below this utterance's loudest part
+            # (a fan or a noisy room can sit above the start threshold the whole time)
+            if loud and level > self.end_fraction * peak:
                 last_loud = now
             if now - last_loud > self.end_silence_s or now - started > self.max_s:
                 speaking = False
+                self.get_logger().info(f"utterance {now - started:.1f} s (peak {peak:.0f}, noise {noise:.0f})"
+                                       + (" - hit the max length: raise min_level?" if now - started > self.max_s else ""))
                 if last_loud - started > 0.25:                           # not just a click
                     audio = b"".join(recorded)
                     threading.Thread(target=self.transcribe, args=(audio,), daemon=True).start()

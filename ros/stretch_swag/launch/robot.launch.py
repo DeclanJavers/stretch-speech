@@ -33,6 +33,7 @@ def generate_launch_description():
         "speech": "espeak",                 # espeak (robot's speaker) | mac (Kokoro, Mac's speaker) | print (no sound)
         "mic": "true",                      # true: robot's microphone -> Whisper on the Mac | false: type (chat_console)
         "mic_device": "default",            # ALSA device for the robot's mic (arecord -l)
+        "mic_min_level": "300.0",           # speech must be at least this loud (watch: ros2 topic echo /swag/mic_level)
         "perception": "faces",              # faces (YuNet + SFace on the robot's CPU) | badges (ArUco fallback)
         "aruco": "stretch",                 # badges only: stretch (Stretch's detector) | swag (ours)
         "pick_mode": "mock",                # mock (pause) | arm (goodie bags in lanes, see pick.py)
@@ -79,7 +80,8 @@ def generate_launch_description():
         Node(package="stretch_swag", executable="badge_faces", output="screen", condition=badges),
         Node(package="stretch_swag", executable="face_detect", output="screen", condition=faces),
         Node(package="stretch_swag", executable="mic_node", output="screen", condition=IfCondition(c["mic"]),
-             parameters=[{"mac_url": ["http://", c["mac_ip"], ":8200"], "device": c["mic_device"]}]),
+             parameters=[{"mac_url": ["http://", c["mac_ip"], ":8200"], "device": c["mic_device"],
+                          "min_level": c["mic_min_level"]}]),
         Node(package="stretch_swag", executable="aruco_detect", name="lane_markers", output="screen",
              parameters=[{"default_length_mm": c["marker_mm"], "debug_image": False, "max_hz": 10.0}],
              remappings=[("/aruco/marker_array", "/swag/lane_markers")]),
